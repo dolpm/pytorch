@@ -743,40 +743,38 @@ class BaseSchedulerNode:
         from torch.utils.flop_counter import FlopCounterMode
 
         op = kernel_name_to_op.get(getattr(self.node, "python_kernel_name", ""), None)
+        # extern kernel is needed for kernel.node.inputs/fx_node
+        if not isinstance(self, ExternKernel) or op is None:
+            return None
 
-        if isinstance(self, ExternKernel):
-            if op is not None:
-                # make mypy happy
-                # mypy isn't smart enough to infer from InputsKernel that self.node.inputs
-                # and self.node.fx_node exists
-                kern: ExternKernel = self
-                if kern.node is None:
-                    return None
-                if any(
-                    len(free_unbacked_symbols(n.get_numel())) > 0
-                    for n in kern.node.inputs
-                ):
-                    # Tensor has unbacked symints, we don't know how to estimate
-                    # runtime for that today
-                    return None
+        # mypy isn't smart enough to infer from ExternKernel that self.node.inputs
+        # and self.node.fx_node exists
+        kern: ExternKernel = self
 
-                with (
-                    FakeTensorMode() as fake_mode,
-                    FlopCounterMode(display=False) as flop_counter_mode,
-                    V.set_current_node(kern.node.fx_node),  # type ignore[attr-defined]
-                    V.set_fake_mode(fake_mode),
-                ):
-                    from .ir import ir_node_to_tensor
+        if kern.node is None:
+            return None
+        if any(len(free_unbacked_symbols(n.get_numel())) > 0 for n in kern.node.inputs):
+            # Tensor has unbacked symints, we don't know how to estimate
+            # runtime for that today
+            return None
 
-                    fake_inputs = [
-                        ir_node_to_tensor(input, guard_shape=False)
-                        for input in kern.node.inputs  # type: ignore[attr-defined]
-                    ]
-                    cls = kern.node.__class__
-                    cls.process_kernel(op, *fake_inputs, **kern.node.kwargs)
+        with (
+            FakeTensorMode() as fake_mode,
+            FlopCounterMode(display=False) as flop_counter_mode,
+            V.set_current_node(kern.node.fx_node),  # type ignore[attr-defined]
+            V.set_fake_mode(fake_mode),
+        ):
+            from .ir import ir_node_to_tensor
 
-                    ret = flop_counter_mode.get_total_flops()
-                    return ret
+            fake_inputs = [
+                ir_node_to_tensor(input, guard_shape=False)
+                for input in kern.node.inputs  # type: ignore[attr-defined]
+            ]
+            cls = kern.node.__class__
+            cls.process_kernel(op, *fake_inputs, **kern.node.kwargs)
+
+            ret = flop_counter_mode.get_total_flops()
+            return ret
         return None
 
     @cache_on_self
