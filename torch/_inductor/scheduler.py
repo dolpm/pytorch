@@ -32,6 +32,7 @@ from torch.fx.experimental.symbolic_shapes import free_unbacked_symbols
 from torch.utils._ordered_set import OrderedSet
 from torch.utils._sympy.symbol import free_symbol_is_type, SymT
 from torch.utils._triton import has_triton
+from torch.utils.flop_counter import FlopCounterMode
 
 from . import comms, config, dependencies, ir, metrics
 from .analyze_preserves_zero_mask import can_codegen_without_upcasts
@@ -739,9 +740,6 @@ class BaseSchedulerNode:
 
     @cache_on_self
     def estimate_flops(self) -> int | None:
-        from torch._subclasses.fake_tensor import FakeTensorMode
-        from torch.utils.flop_counter import FlopCounterMode
-
         op = kernel_name_to_op.get(getattr(self.node, "python_kernel_name", ""), None)
         # extern kernel is needed for kernel.node.inputs/fx_node
         if not isinstance(self, ExternKernel) or op is None:
@@ -759,10 +757,8 @@ class BaseSchedulerNode:
             return None
 
         with (
-            FakeTensorMode() as fake_mode,
             FlopCounterMode(display=False) as flop_counter_mode,
             V.set_current_node(kern.node.fx_node),  # type ignore[attr-defined]
-            V.set_fake_mode(fake_mode),
         ):
             from .ir import ir_node_to_tensor
 
