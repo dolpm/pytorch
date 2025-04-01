@@ -769,8 +769,7 @@ class BaseSchedulerNode:
             cls = kern.node.__class__
             cls.process_kernel(op, *fake_inputs, **kern.node.kwargs)
 
-            ret = flop_counter_mode.get_total_flops()
-            return ret
+            return flop_counter_mode.get_total_flops()
         return None
 
     @cache_on_self
