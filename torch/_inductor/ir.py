@@ -93,7 +93,7 @@ from .utils import (
     sympy_product,
     sympy_subs,
 )
-from .virtualized import ops, OpsValue, V
+from .virtualized import NullHandler, ops, OpsValue, V
 
 
 if TYPE_CHECKING:
@@ -5115,11 +5115,12 @@ class ExternKernel(InputsKernel):
         example_output = kernel(*new_args, **new_kwargs)
 
         unbacked_bindings: Optional[dict[sympy.Symbol, pytree.KeyPath]] = None
-        if shape_env := V.fake_mode.shape_env:
-            rebind_unbacked(shape_env, V.current_node, example_output)
-            unbacked_bindings = compute_unbacked_bindings(
-                shape_env, example_output, V.current_node.meta.get("val")
-            )
+        if not isinstance(V.fake_mode, NullHandler):
+            if shape_env := V.fake_mode.shape_env:
+                rebind_unbacked(shape_env, V.current_node, example_output)
+                unbacked_bindings = compute_unbacked_bindings(
+                    shape_env, example_output, V.current_node.meta.get("val")
+                )
 
         example_out_li = (
             [example_output]
