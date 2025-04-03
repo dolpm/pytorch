@@ -48,10 +48,15 @@ class TestScheduler(TestCase):
             tmp = torch.mm(x + 10, y / 12)
             return torch.mm(tmp, z)
 
+        def composite_relu(x, y):
+            tmp = torch.mm(x, y)
+            return torch.relu(tmp)
+
         test_cases = [
             (torch.mm, [T(4, 5), T(5, 6)], {}),
             (torch.add, [T(4, 5), T(4, 5)], {}),
             (composite, [T(5, 4), T(4, 3), T(3, 12)], {}),
+            (composite_relu, [T(5, 4), T(4, 3)], {}),
         ]
         for op, example_inputs, kwargs in test_cases:
             comp = torch.compile(op)
