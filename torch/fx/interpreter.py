@@ -220,24 +220,24 @@ class Interpreter:
             yield
 
     @compatibility(is_backward_compatible=True)
-    def run_node(self, n: Node) -> Any:
+    def run_node(self, node: Node) -> Any:
         """
-        Run a specific node ``n`` and return the result.
+        Run a specific node ``node`` and return the result.
         Calls into placeholder, get_attr, call_function,
         call_method, call_module, or output depending
         on ``node.op``
 
         Args:
-            n (Node): The Node to execute
+            node (Node): The Node to execute
 
         Returns:
-            Any: The result of executing ``n``
+            Any: The result of executing ``node``
         """
-        with self._set_current_node(n):
-            args, kwargs = self.fetch_args_kwargs_from_env(n)
+        with self._set_current_node(node):
+            args, kwargs = self.fetch_args_kwargs_from_env(node)
             assert isinstance(args, tuple)
             assert isinstance(kwargs, dict)
-            return getattr(self, n.op)(n.target, args, kwargs)
+            return getattr(self, node.op)(node.target, args, kwargs)
 
     # Main Node running APIs
     @compatibility(is_backward_compatible=True)
