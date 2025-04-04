@@ -1,18 +1,16 @@
 # Owner(s): ["module: inductor"]
 
+import tempfile
 import torch
 import json
 import torch.utils.flop_counter
-from torch._inductor.debug import DebugContext
-from torch._inductor.graph import GraphLowering
-from torch._inductor.virtualized import V
-from torch.fx.experimental.proxy_tensor import make_fx
+from torch.testing._internal.common_utils import run_tests, TestCase
+from torch._inductor.analysis.profile import _augment_trace_helper, augment_trace_with_inductor_meta, diff_profiles
+import torch.nn.functional as F
 from torch.testing._internal.common_device_type import (
     dtypes,
     instantiate_device_type_tests,
 )
-from torch.testing._internal.common_utils import run_tests, TestCase
-from torch._inductor.analysis.profile import _augment_trace_helper, diff_profiles
 
 
 example_profile = """
@@ -71,21 +69,111 @@ example_profile = """
   "traceName": "/tmp/compiled_module_profile.json"
 }
 """
+def verify_flops(self, expected_flops, out_profile):
+    for i in len(out_proflie['traceEvents']):
+        self.assertEqual(out_profile['traceEvents'][i]['args']['kernel_flops'], expected_flops[i])
 
-class TestScheduler(TestCase):
+def random_tensor(size, dtype, **kwargs):
+    if dtype in [torch.half, torch.bfloat16, torch.float, torch.double]:
+        return torch.randn(size, dtype=dtype, **kwargs)
+    elif dtype in [torch.uint8, torch.int8, torch.short, torch.int, torch.long]:
+        return torch.randint(0, 100, size, dtype=dtype, **kwargs)
+    else:
+        raise ValueError("Unsupported data type")
+
+def cT(device, dtype):
+    def T(*shape, requires_grad=False):
+        return random_tensor(
+            shape, requires_grad=requires_grad, device=device, dtype=dtype
+        )
+
+    return T
+
+def FlopCounterMode(*args, **kwargs):
+    return torch.utils.flop_counter.FlopCounterMode(*args, **kwargs, display=False)
+
+class TestAnalysis(TestCase):
     def test_augment_trace_helper(self):
         js = json.loads(example_profile)
         out_profile = _augment_trace_helper(js)
         expected_flops = [
             1, 2, 3
         ]
-        for i in len(out_proflie['traceEvents']):
-            self.assertEqual(out_profile['traceEvents'][i]['args']['kernel_flops'], expected_flops[i])
+        verify_flops(self, expected_flops, out_profile)
 
 
-    def test_diff_profile(self):
-        pass
+    @dtypes(torch.float, torch.double)
+    def test_integration(self, device, dtype):
 
+        T = cT(device, dtype)
+ 
+
+
+        def omni_model():
+            # Create input tensors
+            input_conv = T(1, 3, 28, 28)  # batch_size, channels, height, width
+            conv_weight = T(6, 3, 5, 5)  # output_channels, input_channels, kernel_height, kernel_width
+            
+            mat1 = T(2, 3)  # Adjusted matrix 1 for matrix multiplication
+            mat2 = T(3, 4)  # matrix 2 for matrix multiplication
+            
+            batch_mat1 = T(1, 3, 4)  # batched matrix 1 for batch matrix multiplication
+            batch_mat2 = T(1, 4, 24*24)  # batched matrix 2 for batch matrix multiplication
+            
+            # Convolution operation
+            conv_output = F.conv2d(input_conv, conv_weight)
+            
+            # Matrix multiplication (addmm) operation
+            addmm_output = torch.addmm(torch.zeros(2, 4, device=mat1.device, dtype=mat1.dtype), mat1, mat2)
+            
+            # Batch matrix multiplication (bmm) operation
+            bmm_output = torch.bmm(batch_mat1, batch_mat2)
+            
+            # Batch addition matrix multiplication (baddbmm) operation
+            baddbmm_output = torch.baddbmm(torch.zeros(1, 3, 576, device=batch_mat1.device, dtype=batch_mat1.dtype), batch_mat1, batch_mat2)
+            
+            mm_output = torch.mm(mat1, mat2)
+            
+            return torch.cat([conv_output.flatten(), addmm_output.flatten(), bmm_output.flatten(), baddbmm_output.flatten(), mm_output.flatten()])
+
+
+        comp_omni = torch.compile(omni_model, options = {"benchmark_kernel": True, "profile_bandwidth": True})
+            
+        with torch.profiler.profile(record_shapes=True) as p:
+            comp_omni()
+        
+        with FlopCounterMode() as mode:
+            comp_omni()
+        PROFILE_DIR = tempfile.gettempdir()
+        in_path = f"{PROFILE_DIR}/test_profile.json"
+        out_path = f"{PROFILE_DIR}/out_profile.json"
+        p.export_chrome_trace(in_path)
+        augment_trace_with_inductor_meta(in_path, out_path)
+        
+        with open(out_path) as f:
+            out_profile = json.load(f)
+
+
+        flop_counts = mode.flop_counts
+        for event in out_profile['traceEvents']:
+            if event['name'].startswith('aten::mm'):
+                self.assertEqual(event['args']['kernel_flops'], flop_counts['Global'][torch.ops.aten.mm])
+            if event['name'].startswith('aten::addmm'):
+                self.assertEqual(event['args']['kernel_flops'], flop_counts['Global'][torch.ops.aten.addmm])
+            if event['name'].startswith('aten::baddbmm'):
+                self.assertEqual(event['args']['kernel_flops'], flop_counts['Global'][torch.ops.aten.baddbmm])
+            if event['name'].startswith('aten::bmm'):
+                self.assertEqual(event['args']['kernel_flops'], flop_counts['Global'][torch.ops.aten.bmm])
+            # if event['name'].startswith('aten::convolution'):
+            #     print(event['args']['kernel_flops'])
+            #     self.assertEqual(event['args']['kernel_flops'], flop_counts['Global'][torch.ops.aten.convolution])
+            #self.assertEqual(out_profile['traceEvents'][i]['args']['kernel_flops'], expected_flops[i])
+        expected_flops = [
+            1, 2, 3
+        ]
+        #verify_flops(self, expected_flops, out_profile)
+
+instantiate_device_type_tests(TestAnalysis, globals())
 
 if __name__ == "__main__":
     run_tests()

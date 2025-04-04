@@ -3,7 +3,7 @@ import math
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Union
 
 import torch
 from torch.autograd import DeviceType
@@ -231,33 +231,53 @@ def diff_profiles(diff_path1: str, diff_path2: str) -> None:
 class ParseException(RuntimeError):
     pass
 
-def conv_adapter(args: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
-    tmp = list(args)
-    # just set transpose to True
-    # TODO actually set it proper
-    tmp[6] = True
+def conv_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    tmp = list(shapes)
+    tmp[6] = bool(concrete[6])
     return tuple(tmp), {}
 
-def default_adapter(args: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
-    return args, {}
+def default_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    return shapes, {}
 
-def addmm_adapter(args: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
-    return args, {}
+def addmm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    tmp = list(shapes)[:3]
+    return tuple(tmp), {}
+def bmm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    tmp = list(shapes)
+    return tuple(tmp[:2]), {}
 
+def baddbmm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    tmp = list(shapes)[:3]
+    return tuple(tmp), {}
+def mm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    return shapes, {}
+
+# adapters convert the json trace into a format that works with flops_counter
 adapters = {
     "convolution": conv_adapter,
     "_convolution": conv_adapter,
     "addmm": addmm_adapter,
     "bmm": bmm_adapter,
     "baddbmm": baddbmm_adapter,
-    "sdpa": sdpa_adapter,
-    "_flash_attention_backward": default_adapter,
-    "_efficient_attention_backward": default_adapter,
+    "mm": mm_adapter,
     "_scaled_mm": default_adapter,
-    "_scaled_dot_product_efficient_attention": default_adapter,
-    "_scaled_dot_product_flash_attention": default_adapter,
-    "_scaled_dot_product_cudnn_attention": default_adapter,
+    # TODO
+    # "sdpa": sdpa_adapter,
+    # "_flash_attention_backward": default_adapter,
+    # "_efficient_attention_backward": default_adapter,
+    # "_scaled_dot_product_efficient_attention": default_adapter,
+    # "_scaled_dot_product_flash_attention": default_adapter,
+    # "_scaled_dot_product_cudnn_attention": default_adapter,
 }
+def flatten(lst: list[Union[int, list[int]]]) -> list[int]:
+    """Flatten a nested list of integers."""
+    flat_list = []
+    for item in lst:
+        if isinstance(item, list):
+            flat_list.extend(flatten(item))
+        else:
+            flat_list.append(item)
+    return flat_list
 
 def _augment_trace_helper(data: dict[str, Any]) -> dict[str, Any]:
     ATEN_PREFIX = "aten::"
@@ -270,11 +290,13 @@ def _augment_trace_helper(data: dict[str, Any]) -> dict[str, Any]:
 
         flop_function = flop_registry[op_obj]
         
-        inputs = event["args"]["Input Dims"]
+        input_shapes = event["args"]["Input Dims"]
+        concrete = event["args"]["Concrete Inputs"]
         if op_name in adapters:
-            args, kwargs = adapters[op_name](inputs)
+            args, kwargs = adapters[op_name](input_shapes, concrete)
         else:
-            args, kwargs = default_adapter(inputs)
+            breakpoint()
+            args, kwargs = default_adapter(input_shapes, concrete)
         return flop_function(*args, **kwargs)
 
     def estimate_bandwidth(event: dict[str, Any]) -> float:
@@ -289,7 +311,10 @@ def _augment_trace_helper(data: dict[str, Any]) -> dict[str, Any]:
                 isize = 0
             else:
                 isize = getattr(torch, tipe).itemsize
-            bw += isize * math.prod(size)
+            try:
+                bw += isize * math.prod(flatten(size))
+            except:
+                breakpoint()
         return bw
 
     for event in data["traceEvents"]:
