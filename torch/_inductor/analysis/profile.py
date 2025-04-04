@@ -231,36 +231,65 @@ def diff_profiles(diff_path1: str, diff_path2: str) -> None:
 class ParseException(RuntimeError):
     pass
 
+def conv_adapter(args: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    tmp = list(args)
+    # just set transpose to True
+    # TODO actually set it proper
+    tmp[6] = True
+    return tuple(tmp), {}
 
-def augment_trace_with_inductor_meta(
-    input_file_path: str, output_file_path: str
-) -> None:
-    """
-    Many of the important ops don't go through the triton flops calculation, because they're external kernels. Instead, we will
-    augment the profile after it runs using the input information
-    """
-    # Load the JSON file
-    with open(input_file_path) as f:
-        data = json.load(f)
+def default_adapter(args: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    return args, {}
 
+def addmm_adapter(args: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    return args, {}
+
+adapters = {
+    "convolution": conv_adapter,
+    "_convolution": conv_adapter,
+    "addmm": addmm_adapter,
+    "bmm": bmm_adapter,
+    "baddbmm": baddbmm_adapter,
+    "sdpa": sdpa_adapter,
+    "_flash_attention_backward": default_adapter,
+    "_efficient_attention_backward": default_adapter,
+    "_scaled_mm": default_adapter,
+    "_scaled_dot_product_efficient_attention": default_adapter,
+    "_scaled_dot_product_flash_attention": default_adapter,
+    "_scaled_dot_product_cudnn_attention": default_adapter,
+}
+
+def _augment_trace_helper(data: dict[str, Any]) -> dict[str, Any]:
     ATEN_PREFIX = "aten::"
 
     def calculate_flops(event: dict[str, Any]) -> int:
         op_name = name[len(ATEN_PREFIX) :]
-        flop_function = flop_registry[getattr(torch.ops.aten, op_name)]
-        input_sizes = filter(lambda x: x != [], event["args"]["Input Dims"])
-        return flop_function(*input_sizes)
+        op_obj = getattr(torch.ops.aten, op_name)
+        if not op_obj in flop_registry:
+            return 0
+
+        flop_function = flop_registry[op_obj]
+        
+        inputs = event["args"]["Input Dims"]
+        if op_name in adapters:
+            args, kwargs = adapters[op_name](inputs)
+        else:
+            args, kwargs = default_adapter(inputs)
+        return flop_function(*args, **kwargs)
 
     def estimate_bandwidth(event: dict[str, Any]) -> float:
         """
         This estimate isn't the best because it doesn't know if two input buffers are the same buffer, leading to an
         overestimate of the real achieved bandwidth.
         """
-        sizes_and_types = zip(event["args"]["Input Dims"], event["args"]["Input Type"])
+        sizes_and_types = zip(event["args"]["Input Dims"], event["args"]["Input type"])
         bw = 0
         for size, tipe in sizes_and_types:
-            dtype = getattr(torch, tipe)
-            bw += dtype.itemsize * math.prod(size)
+            if not hasattr(torch, tipe):
+                isize = 0
+            else:
+                isize = getattr(torch, tipe).itemsize
+            bw += isize * math.prod(size)
         return bw
 
     for event in data["traceEvents"]:
@@ -270,9 +299,25 @@ def augment_trace_with_inductor_meta(
         if name.startswith(ATEN_PREFIX):
             event["args"]["kernel_flops"] = calculate_flops(event)
             event["args"]["kernel_bandwidth_estimate"] = estimate_bandwidth(event)
+    return data
 
+def augment_trace_with_inductor_meta(
+    input_file_path: str, output_file_path: str
+) -> None:
+    """
+    Many of the important ops don't go through the triton flops calculation, because they're external kernels. Instead, we will
+    augment the profile after it runs using the input information
+    """
+    # load
+    with open(input_file_path) as f:
+        data = json.load(f)
+    # process
+    processed_data = _augment_trace_helper(data)
+    # store
     with open(output_file_path, "w") as f:
-        json.dump(data, f)
+        json.dump(processed_data, f)
+
+
 
 
 def main() -> None:
