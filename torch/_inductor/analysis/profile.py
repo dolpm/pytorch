@@ -1,20 +1,21 @@
-import torch
+import json
+import math
 import tempfile
-from typing import Any
 from collections import defaultdict
 from dataclasses import dataclass
-import json
-import tempfile
-from collections import defaultdict
+from typing import Any
 
+import torch
 from torch.autograd import DeviceType
 from torch.utils._ordered_set import OrderedSet
+from torch.utils.flop_counter import flop_registry
 
-from torch.utils._ordered_set import OrderedSet
+
 @dataclass(frozen=True)
 class KernelStats:
     flops: int
     bw: float
+
 
 PROFILE_DIR = tempfile.gettempdir()
 PROFILE_PATH = f"{PROFILE_DIR}/compiled_module_profile.json"
@@ -29,7 +30,10 @@ class ProfileEvent:
     # runs. It should be an integer but define a float just in case.
     count: float
 
+
 KernelNameMap = defaultdict[str, OrderedSet[KernelStats]]
+
+
 def parse_profile_event_list(
     benchmark_name: str,
     event_list: torch.autograd.profiler_util.EventList,
@@ -37,6 +41,7 @@ def parse_profile_event_list(
     nruns: int,
     device_name: str,
 ) -> None:
+    # breakpoint()
     def get_self_device_time(
         ev: torch.autograd.profiler_util.EventList,
     ) -> float:
@@ -154,6 +159,8 @@ def parse_profile_event_list(
         print(tabulate_line)
 
     report()
+
+
 def diff_profiles(diff_path1: str, diff_path2: str) -> None:
     from collections import defaultdict
 
@@ -221,11 +228,58 @@ def diff_profiles(diff_path1: str, diff_path2: str) -> None:
     combine_name_maps(diff_path1, other_nm, diff_path2, diff_nm)
 
 
-def main():
+class ParseException(RuntimeError):
+    pass
+
+
+def augment_trace_with_inductor_meta(
+    input_file_path: str, output_file_path: str
+) -> None:
+    """
+    Many of the important ops don't go through the triton flops calculation, because they're external kernels. Instead, we will
+    augment the profile after it runs using the input information
+    """
+    # Load the JSON file
+    with open(input_file_path) as f:
+        data = json.load(f)
+
+    ATEN_PREFIX = "aten::"
+
+    def calculate_flops(event: dict[str, Any]) -> int:
+        op_name = name[len(ATEN_PREFIX) :]
+        flop_function = flop_registry[getattr(torch.ops.aten, op_name)]
+        input_sizes = filter(lambda x: x != [], event["args"]["Input Dims"])
+        return flop_function(*input_sizes)
+
+    def estimate_bandwidth(event: dict[str, Any]) -> float:
+        """
+        This estimate isn't the best because it doesn't know if two input buffers are the same buffer, leading to an
+        overestimate of the real achieved bandwidth.
+        """
+        sizes_and_types = zip(event["args"]["Input Dims"], event["args"]["Input Type"])
+        bw = 0
+        for size, tipe in sizes_and_types:
+            dtype = getattr(torch, tipe)
+            bw += dtype.itemsize * math.prod(size)
+        return bw
+
+    for event in data["traceEvents"]:
+        if "name" not in event:
+            raise ParseException("no name element in event")
+        name = event["name"]
+        if name.startswith(ATEN_PREFIX):
+            event["args"]["kernel_flops"] = calculate_flops(event)
+            event["args"]["kernel_bandwidth_estimate"] = estimate_bandwidth(event)
+
+    with open(output_file_path, "w") as f:
+        json.dump(data, f)
+
+
+def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser()
-    
+
     parser.add_argument(
         "--diff",
         "-d",
@@ -233,11 +287,22 @@ def main():
         nargs=2,
         help="Two json traces to compare with",
     )
+    parser.add_argument(
+        "--augment_trace",
+        "-a",
+        type=str,
+        nargs=2,
+        metavar=("input_file", "output_file"),
+        help="Augment a trace with inductor meta information. Provide input and output file paths.",
+    )
 
     args = parser.parse_args()
 
     if args.diff:
         diff_profiles(args.diff[0], args.diff[1])
+
+    if args.augment:
+        augment_trace_with_inductor_meta(args.augment[0], args.augment[1])
 
 
 if __name__ == "__main__":
