@@ -4,13 +4,15 @@ import tempfile
 import torch
 import json
 import torch.utils.flop_counter
+from unittest.mock import patch
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch._inductor.analysis.profile import _augment_trace_helper, augment_trace_with_inductor_meta, diff_profiles
+from torch._inductor.analysis.profile import _augment_trace_helper, augment_trace_with_inductor_meta, diff_profiles, main
 import torch.nn.functional as F
 from torch.testing._internal.common_device_type import (
     dtypes,
     instantiate_device_type_tests,
 )
+from io import StringIO
 
 
 example_profile = """
@@ -92,8 +94,65 @@ def cT(device, dtype):
 def FlopCounterMode(*args, **kwargs):
     return torch.utils.flop_counter.FlopCounterMode(*args, **kwargs, display=False)
 
+TMP_DIR = tempfile.mkdtemp()
+TRACE1 = f'${TMP_DIR}/trace1.txt'
+TRACE2 = f'${TMP_DIR}/trace2.txt'
+def omni_model(device, dtype):
+    T = cT(device, dtype)
+    def model():
+        # Create input tensors
+        input_conv = T(1, 3, 28, 28)  # batch_size, channels, height, width
+        conv_weight = T(6, 3, 5, 5)  # output_channels, input_channels, kernel_height, kernel_width
+        
+        mat1 = T(2, 3)  # Adjusted matrix 1 for matrix multiplication
+        mat2 = T(3, 4)  # matrix 2 for matrix multiplication
+        
+        batch_mat1 = T(1, 3, 4)  # batched matrix 1 for batch matrix multiplication
+        batch_mat2 = T(1, 4, 24*24)  # batched matrix 2 for batch matrix multiplication
+        
+        # Convolution operation
+        conv_output = F.conv2d(input_conv, conv_weight)
+        
+        # Matrix multiplication (addmm) operation
+        addmm_output = torch.addmm(torch.zeros(2, 4, device=mat1.device, dtype=mat1.dtype), mat1, mat2)
+        
+        # Batch matrix multiplication (bmm) operation
+        bmm_output = torch.bmm(batch_mat1, batch_mat2)
+        
+        # Batch addition matrix multiplication (baddbmm) operation
+        baddbmm_output = torch.baddbmm(torch.zeros(1, 3, 576, device=batch_mat1.device, dtype=batch_mat1.dtype), batch_mat1, batch_mat2)
+        
+        mm_output = torch.mm(mat1, mat2)
+        
+        return torch.cat([conv_output.flatten(), addmm_output.flatten(), bmm_output.flatten(), baddbmm_output.flatten(), mm_output.flatten()])
+    return torch.compile(model, options = {"benchmark_kernel": True, "profile_bandwidth": True})
+prefix = ["profile.py", "1"]
+
 class TestAnalysis(TestCase):
+    def test_noop(self):
+        with (patch('sys.stdout', new_callable=StringIO) as mock_stdout, 
+              patch('sys.argv', [*prefix]) as mock_argv):
+            main()
+            self.assertEqual(mock_stdout.getvalue(), "")
+
+    def test_nruns(self, device, dtype):
+        om = omni_model(device, dtype)
+        main()
+        self.assertEqual(mock_stdout.getvalue(), "")
+
+    @dtypes(torch.float, torch.double)
+    def test_diff(self, device, dtype):
+        om = omni_model(device, dtype)
+        with (patch('sys.stdout', new_callable=StringIO) as mock_stdout, 
+              patch('sys.argv', [*prefix, '--diff', TRACE1, TRACE2]) as mock_argv):
+            with torch.profiler.profile(record_shapes=True) as p:
+                comp_omni()
+            main()
+            print("foo")
+            print(mock_stdout.getvalue())
+
     def test_augment_trace_helper(self):
+        breakpoint()
         js = json.loads(example_profile)
         out_profile = _augment_trace_helper(js)
         expected_flops = [
@@ -104,40 +163,8 @@ class TestAnalysis(TestCase):
 
     @dtypes(torch.float, torch.double)
     def test_integration(self, device, dtype):
-
-        T = cT(device, dtype)
- 
-
-
-        def omni_model():
-            # Create input tensors
-            input_conv = T(1, 3, 28, 28)  # batch_size, channels, height, width
-            conv_weight = T(6, 3, 5, 5)  # output_channels, input_channels, kernel_height, kernel_width
-            
-            mat1 = T(2, 3)  # Adjusted matrix 1 for matrix multiplication
-            mat2 = T(3, 4)  # matrix 2 for matrix multiplication
-            
-            batch_mat1 = T(1, 3, 4)  # batched matrix 1 for batch matrix multiplication
-            batch_mat2 = T(1, 4, 24*24)  # batched matrix 2 for batch matrix multiplication
-            
-            # Convolution operation
-            conv_output = F.conv2d(input_conv, conv_weight)
-            
-            # Matrix multiplication (addmm) operation
-            addmm_output = torch.addmm(torch.zeros(2, 4, device=mat1.device, dtype=mat1.dtype), mat1, mat2)
-            
-            # Batch matrix multiplication (bmm) operation
-            bmm_output = torch.bmm(batch_mat1, batch_mat2)
-            
-            # Batch addition matrix multiplication (baddbmm) operation
-            baddbmm_output = torch.baddbmm(torch.zeros(1, 3, 576, device=batch_mat1.device, dtype=batch_mat1.dtype), batch_mat1, batch_mat2)
-            
-            mm_output = torch.mm(mat1, mat2)
-            
-            return torch.cat([conv_output.flatten(), addmm_output.flatten(), bmm_output.flatten(), baddbmm_output.flatten(), mm_output.flatten()])
-
-
-        comp_omni = torch.compile(omni_model, options = {"benchmark_kernel": True, "profile_bandwidth": True})
+        om = omni_model(device, dtype)
+        comp_omni = torch.compile(om, options = {"benchmark_kernel": True, "profile_bandwidth": True})
             
         with torch.profiler.profile(record_shapes=True) as p:
             comp_omni()
@@ -164,14 +191,12 @@ class TestAnalysis(TestCase):
                 self.assertEqual(event['args']['kernel_flops'], flop_counts['Global'][torch.ops.aten.baddbmm])
             if event['name'].startswith('aten::bmm'):
                 self.assertEqual(event['args']['kernel_flops'], flop_counts['Global'][torch.ops.aten.bmm])
+            # TODO fix convolution
+            # TODO transposed convolution
             # if event['name'].startswith('aten::convolution'):
             #     print(event['args']['kernel_flops'])
             #     self.assertEqual(event['args']['kernel_flops'], flop_counts['Global'][torch.ops.aten.convolution])
             #self.assertEqual(out_profile['traceEvents'][i]['args']['kernel_flops'], expected_flops[i])
-        expected_flops = [
-            1, 2, 3
-        ]
-        #verify_flops(self, expected_flops, out_profile)
 
 instantiate_device_type_tests(TestAnalysis, globals())
 
