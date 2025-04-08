@@ -1,12 +1,14 @@
 # Owner(s): ["module: inductor"]
 
 import tempfile
+import uuid
 import torch
 import json
 import torch.utils.flop_counter
 from unittest.mock import patch
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch._inductor.analysis.profile import _augment_trace_helper, augment_trace_with_inductor_meta, diff_profiles, main
+from torch._inductor.analysis.profile import _augment_trace_helper, _augment_trace_with_inductor_meta, main
+from torch._inductor.utils import timed
 import torch.nn.functional as F
 from torch.testing._internal.common_device_type import (
     dtypes,
@@ -95,8 +97,10 @@ def FlopCounterMode(*args, **kwargs):
     return torch.utils.flop_counter.FlopCounterMode(*args, **kwargs, display=False)
 
 TMP_DIR = tempfile.mkdtemp()
-TRACE1 = f'${TMP_DIR}/trace1.txt'
-TRACE2 = f'${TMP_DIR}/trace2.txt'
+def trace_files():
+    TRACE1 = f'{TMP_DIR}/trace1-{uuid.uuid4()}.txt'
+    TRACE2 = f'{TMP_DIR}/trace2-{uuid.uuid4()}.txt'
+    return TRACE1, TRACE2
 def omni_model(device, dtype):
     T = cT(device, dtype)
     def model():
@@ -126,7 +130,7 @@ def omni_model(device, dtype):
         
         return torch.cat([conv_output.flatten(), addmm_output.flatten(), bmm_output.flatten(), baddbmm_output.flatten(), mm_output.flatten()])
     return torch.compile(model, options = {"benchmark_kernel": True, "profile_bandwidth": True})
-prefix = ["profile.py", "1"]
+prefix = ["profile.py"]
 
 class TestAnalysis(TestCase):
     def test_noop(self):
@@ -135,34 +139,53 @@ class TestAnalysis(TestCase):
             main()
             self.assertEqual(mock_stdout.getvalue(), "")
 
-    def test_nruns(self, device, dtype):
-        om = omni_model(device, dtype)
-        main()
-        self.assertEqual(mock_stdout.getvalue(), "")
-
     @dtypes(torch.float, torch.double)
     def test_diff(self, device, dtype):
+        """
+        diff, testing out the nruns feature too.
+        """
         om = omni_model(device, dtype)
-        with (patch('sys.stdout', new_callable=StringIO) as mock_stdout, 
-              patch('sys.argv', [*prefix, '--diff', TRACE1, TRACE2]) as mock_argv):
-            with torch.profiler.profile(record_shapes=True) as p:
-                comp_omni()
+        REPEAT = 5
+        trace1, trace2 = trace_files()
+        with torch.profiler.profile(record_shapes=True) as p:
+            om()
+        p.export_chrome_trace(trace1)
+
+        with torch.profiler.profile(record_shapes=True) as p:
+            for _ in range(REPEAT):
+                om()
+        p.export_chrome_trace(trace2)
+
+        # patch('sys.stdout', new_callable=StringIO) as mock_stdout, 
+        with (
+              patch('sys.argv', [*prefix, '--diff', trace1, "1", trace2, str(REPEAT)]) as mock_argv):
             main()
-            print("foo")
-            print(mock_stdout.getvalue())
+            #self.assertEqual(mock_stdout.getvalue(), "")
 
     def test_augment_trace_helper(self):
-        breakpoint()
         js = json.loads(example_profile)
-        out_profile = _augment_trace_helper(js)
+        out_profile = _augment_trace_helper(js, 1)
         expected_flops = [
             1, 2, 3
         ]
         verify_flops(self, expected_flops, out_profile)
 
+    @dtypes(torch.float, torch.double)
+    def test_augment_trace_helper_args(self, device, dtype):
+        om = omni_model(device, dtype)
+        with torch.profiler.profile(record_shapes=True) as p:
+            om()
+        trace1, trace2 = trace_files()
+        p.export_chrome_trace(trace1)
+        # patch('sys.stdout', new_callable=StringIO) as mock_stdout, 
+        with (
+              patch('sys.argv', [*prefix, "--augment_trace", trace1, trace2]) as mock_argv):
+            main()
+            #self.assertEqual(mock_stdout.getvalue(), "")
+
 
     @dtypes(torch.float, torch.double)
-    def test_integration(self, device, dtype):
+    def test_augment_trace_against_flop_counter(self, device, dtype):
         om = omni_model(device, dtype)
         comp_omni = torch.compile(om, options = {"benchmark_kernel": True, "profile_bandwidth": True})
             
@@ -175,7 +198,7 @@ class TestAnalysis(TestCase):
         in_path = f"{PROFILE_DIR}/test_profile.json"
         out_path = f"{PROFILE_DIR}/out_profile.json"
         p.export_chrome_trace(in_path)
-        augment_trace_with_inductor_meta(in_path, out_path)
+        augment_trace_with_inductor_meta(in_path, out_path, 1)
         
         with open(out_path) as f:
             out_profile = json.load(f)

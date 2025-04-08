@@ -3,7 +3,7 @@ import math
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Union
+from typing import Any, Union, Optional
 
 import torch
 from torch.autograd import DeviceType
@@ -33,10 +33,189 @@ class ProfileEvent:
 
 KernelNameMap = defaultdict[str, OrderedSet[KernelStats]]
 
+# adapters convert the json trace into a format that works with flops_counter
+adapters_map: dict[str, Any] = {}
+
+def register_adapter(aten: str | list[str]):
+    def decorator(func):
+        global _adapters_map
+        def wrapper(*args, **kwargs):
+            result = func(*args, **kwargs)
+            return result
+
+        if isinstance(aten, str):
+            _adapters_map[aten] = wrapper
+        else:
+            for at in aten:
+                _adapters_map[at] = wrapper
+        return wrapper
+    return decorator
+
+@register_adapter(["convolution", "_convolution"])
+def conv_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    tmp = list(shapes)
+    tmp[6] = bool(concrete[6])
+    return tuple(tmp), {}
+
+
+def default_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    return shapes, {}
+
+@register_adapter("addmm")
+def addmm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    tmp = list(shapes)[:3]
+    return tuple(tmp), {}
+
+@register_adapter("bmm")
+def bmm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    tmp = list(shapes)
+    return tuple(tmp[:2]), {}
+
+@register_adapter("baddbmm")
+def baddbmm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    tmp = list(shapes)[:3]
+    return tuple(tmp), {}
+
+@register_adapter("mm")
+def mm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
+    return shapes, {}
+
+def _augment_trace_helper(data: dict[str, Any], nruns: int) -> dict[str, Any]:
+    ATEN_PREFIX = "aten::"
+    get_kernels(data) 
+
+    for event in data["traceEvents"]:
+        if "name" not in event:
+            raise ParseException("no name element in event")
+        name = event["name"]
+        if name.startswith(ATEN_PREFIX):
+            event["args"]["kernel_flops"] = calculate_flops(event)
+            event["args"]["kernel_bandwidth_estimate"] = estimate_bandwidth(event)
+    return data
+
+def _calculate_flops(event: dict[str, Any]) -> int:
+    op_name = name[len(ATEN_PREFIX) :]
+    op_obj = getattr(torch.ops.aten, op_name)
+    if not op_obj in flop_registry:
+        return 0
+
+    flop_function = flop_registry[op_obj]
+    
+    input_shapes = event["args"]["Input Dims"]
+    concrete = event["args"]["Concrete Inputs"]
+    if op_name in adapters_map:
+        args, kwargs = adapters_map[op_name](input_shapes, concrete)
+    else:
+        breakpoint()
+        args, kwargs = default_adapter(input_shapes, concrete)
+    return flop_function(*args, **kwargs)
+def estimate_bandwidth(event: dict[str, Any]) -> float:
+    """
+    This estimate isn't the best because it doesn't know if two input buffers are the same buffer, leading to an
+    overestimate of the real achieved bandwidth.
+    """
+    sizes_and_types = zip(event["args"]["Input Dims"], event["args"]["Input type"])
+    bw = 0
+    for size, tipe in sizes_and_types:
+        if not hasattr(torch, tipe):
+            isize = 0
+        else:
+            isize = getattr(torch, tipe).itemsize
+        try:
+            bw += isize * math.prod(flatten(size))
+        except:
+            breakpoint()
+    return bw
+class JsonProfile:
+    """operations on json traces"""
+    _stats: KernelNameMap
+    def __init__(self, path: str, nruns: int, device_name: Optional[str] = None, benchmark_name: Optinal[str] = None):
+        self.path = path
+        with open(path) as f:
+            self.data = json.load(f)
+        self.nruns = nruns
+        self.device_name = device_name
+        self.benchmark_name = benchmark_name
+
+    def calculate_flops(self, event: dict[str, Any]) -> int:
+        return _calculate_flops(event)
+
+    def estimate_bandwidth(self, event: dict[str, Any]) -> float:
+        """
+        This estimate isn't the best because it doesn't know if two input buffers are the same buffer, leading to an
+        overestimate of the real achieved bandwidth.
+        """
+        return _estimate_bandwidth(event)
+    def augment_trace(self) -> None:
+        self.data = _augment_trace_helper(self.data, self.nruns)
+    def _compute_events(self) -> None:
+        pass
+    def _compute_stats(self) -> None:
+        """populates the name -> stats map"""
+        if self._stats is not None:
+            name_map: KernelNameMap = defaultdict(OrderedSet)
+            for event in data["traceEvents"]:
+                if (
+                    "args" in event
+                    and "kernel_flops" in event["args"]
+                    and "kernel_bandwidth" in event["args"]
+                ):
+                    name_map[event["name"]].add(
+                        KernelStats(
+                            event["args"]["kernel_flops"], event["args"]["kernel_bandwidth"]
+                        )
+                    )
+            self._stats
+    def report(self, other: Optional["JsonProfile"] = None) -> str:
+        self._compute_stats()
+        self._compute_events()
+        def combine_name_maps(
+            filename1: str,
+            name_map1: KernelNameMap,
+            filename2: str,
+            name_map2: KernelNameMap,
+        ) -> None:
+            from tabulate import tabulate
+
+            combined_table = {}
+
+            # Get all unique names from both name maps
+            all_names = OrderedSet(list(name_map1.keys()) + list(name_map2.keys()))
+
+            for name in all_names:
+                stats1 = name_map1.get(name, OrderedSet())
+                stats2 = name_map2.get(name, OrderedSet())
+
+                flops_avg1 = (
+                    sum(stat.flops for stat in stats1) / len(stats1) if stats1 else 0
+                )
+                bw_avg1 = sum(stat.bw for stat in stats1) / len(stats1) if stats1 else 0
+
+                flops_avg2 = (
+                    sum(stat.flops for stat in stats2) / len(stats2) if stats2 else 0
+                )
+                bw_avg2 = sum(stat.bw for stat in stats2) / len(stats2) if stats2 else 0
+
+                combined_table[name] = [flops_avg1, bw_avg1, flops_avg2, bw_avg2]
+
+            headers = [
+                "Kernel Name",
+                f"{filename1} FLOPS",
+                f"{filename1} Bandwidth",
+                f"{filename2} FLOPS",
+                f"{filename2} Bandwidth",
+            ]
+            table = [[name] + values for name, values in combined_table.items()]
+            print(tabulate(table, headers=headers, tablefmt="grid"))
+    def dump(self, out: str) -> None:
+        with open(out, "w") as f:
+            json.dump(processed_data, f)
+
+
 
 def parse_profile_event_list(
     benchmark_name: str,
-    event_list: torch.autograd.profiler_util.EventList,
+    event_list: torch.autograd.profiler_util.EventList | dict[str, Any],
     wall_time_ms: float,
     nruns: int,
     device_name: str,
@@ -64,6 +243,7 @@ def parse_profile_event_list(
         )
         all_events[category].append(profile_ev)
 
+    #breakpoint()
     for ev in event_list:
         assert not ev.is_legacy, "Don't support the legacy profiler"
         if ev.device_type == DeviceType.CPU:
@@ -158,117 +338,14 @@ def parse_profile_event_list(
 
         print(tabulate_line)
 
+    #breakpoint()
     report()
-
-
-def diff_profiles(diff_path1: str, diff_path2: str) -> None:
-    from collections import defaultdict
-
-    def parse(data: dict[str, Any]) -> KernelNameMap:
-        name_map: KernelNameMap = defaultdict(OrderedSet)
-        for event in data["traceEvents"]:
-            if (
-                "args" in event
-                and "kernel_flops" in event["args"]
-                and "kernel_bandwidth" in event["args"]
-            ):
-                name_map[event["name"]].add(
-                    KernelStats(
-                        event["args"]["kernel_flops"], event["args"]["kernel_bandwidth"]
-                    )
-                )
-        return name_map
-
-    def combine_name_maps(
-        filename1: str,
-        name_map1: KernelNameMap,
-        filename2: str,
-        name_map2: KernelNameMap,
-    ) -> None:
-        from tabulate import tabulate
-
-        combined_table = {}
-
-        # Get all unique names from both name maps
-        all_names = OrderedSet(list(name_map1.keys()) + list(name_map2.keys()))
-
-        for name in all_names:
-            stats1 = name_map1.get(name, OrderedSet())
-            stats2 = name_map2.get(name, OrderedSet())
-
-            flops_avg1 = (
-                sum(stat.flops for stat in stats1) / len(stats1) if stats1 else 0
-            )
-            bw_avg1 = sum(stat.bw for stat in stats1) / len(stats1) if stats1 else 0
-
-            flops_avg2 = (
-                sum(stat.flops for stat in stats2) / len(stats2) if stats2 else 0
-            )
-            bw_avg2 = sum(stat.bw for stat in stats2) / len(stats2) if stats2 else 0
-
-            combined_table[name] = [flops_avg1, bw_avg1, flops_avg2, bw_avg2]
-
-        headers = [
-            "Kernel Name",
-            f"{filename1} FLOPS",
-            f"{filename1} Bandwidth",
-            f"{filename2} FLOPS",
-            f"{filename2} Bandwidth",
-        ]
-        table = [[name] + values for name, values in combined_table.items()]
-        print(tabulate(table, headers=headers, tablefmt="grid"))
-
-    def parse_helper(filename: str) -> defaultdict[str, OrderedSet[KernelStats]]:
-        with open(filename) as f:
-            data = json.load(f)
-        return parse(data)
-
-    other_nm = parse_helper(diff_path1)
-    diff_nm = parse_helper(diff_path2)
-    combine_name_maps(diff_path1, other_nm, diff_path2, diff_nm)
 
 
 class ParseException(RuntimeError):
     pass
 
-def conv_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
-    tmp = list(shapes)
-    tmp[6] = bool(concrete[6])
-    return tuple(tmp), {}
 
-def default_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
-    return shapes, {}
-
-def addmm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
-    tmp = list(shapes)[:3]
-    return tuple(tmp), {}
-def bmm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
-    tmp = list(shapes)
-    return tuple(tmp[:2]), {}
-
-def baddbmm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
-    tmp = list(shapes)[:3]
-    return tuple(tmp), {}
-def mm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
-    return shapes, {}
-
-# adapters convert the json trace into a format that works with flops_counter
-adapters = {
-    "convolution": conv_adapter,
-    "_convolution": conv_adapter,
-    "addmm": addmm_adapter,
-    "bmm": bmm_adapter,
-    "baddbmm": baddbmm_adapter,
-    "mm": mm_adapter,
-    "_scaled_mm": default_adapter,
-    # TODO
-    # "sdpa": sdpa_adapter,
-    # "_flash_attention_backward": default_adapter,
-    # "_efficient_attention_backward": default_adapter,
-    # "_scaled_dot_product_efficient_attention": default_adapter,
-    # "_scaled_dot_product_flash_attention": default_adapter,
-    # "_scaled_dot_product_cudnn_attention": default_adapter,
-}
 def flatten(lst: list[Union[int, list[int]]]) -> list[int]:
     """Flatten a nested list of integers."""
     flat_list = []
@@ -279,68 +356,23 @@ def flatten(lst: list[Union[int, list[int]]]) -> list[int]:
             flat_list.append(item)
     return flat_list
 
-def _augment_trace_helper(data: dict[str, Any]) -> dict[str, Any]:
-    ATEN_PREFIX = "aten::"
+def get_kernels(data: dict[str, Any]) -> dict[str, list[ProfileEvent]]:
+    #breakpoint()
+    pass
 
-    def calculate_flops(event: dict[str, Any]) -> int:
-        op_name = name[len(ATEN_PREFIX) :]
-        op_obj = getattr(torch.ops.aten, op_name)
-        if not op_obj in flop_registry:
-            return 0
 
-        flop_function = flop_registry[op_obj]
-        
-        input_shapes = event["args"]["Input Dims"]
-        concrete = event["args"]["Concrete Inputs"]
-        if op_name in adapters:
-            args, kwargs = adapters[op_name](input_shapes, concrete)
-        else:
-            breakpoint()
-            args, kwargs = default_adapter(input_shapes, concrete)
-        return flop_function(*args, **kwargs)
-
-    def estimate_bandwidth(event: dict[str, Any]) -> float:
-        """
-        This estimate isn't the best because it doesn't know if two input buffers are the same buffer, leading to an
-        overestimate of the real achieved bandwidth.
-        """
-        sizes_and_types = zip(event["args"]["Input Dims"], event["args"]["Input type"])
-        bw = 0
-        for size, tipe in sizes_and_types:
-            if not hasattr(torch, tipe):
-                isize = 0
-            else:
-                isize = getattr(torch, tipe).itemsize
-            try:
-                bw += isize * math.prod(flatten(size))
-            except:
-                breakpoint()
-        return bw
-
-    for event in data["traceEvents"]:
-        if "name" not in event:
-            raise ParseException("no name element in event")
-        name = event["name"]
-        if name.startswith(ATEN_PREFIX):
-            event["args"]["kernel_flops"] = calculate_flops(event)
-            event["args"]["kernel_bandwidth_estimate"] = estimate_bandwidth(event)
-    return data
-
-def augment_trace_with_inductor_meta(
-    input_file_path: str, output_file_path: str
+def _augment_trace_with_inductor_meta(
+    input_file_path: str, output_file_path: str, nruns: int
 ) -> None:
     """
     Many of the important ops don't go through the triton flops calculation, because they're external kernels. Instead, we will
     augment the profile after it runs using the input information
     """
-    # load
-    with open(input_file_path) as f:
-        data = json.load(f)
+    p = JsonProfile(input_file_path, nruns)
     # process
-    processed_data = _augment_trace_helper(data)
+    processed_data = p.augment_trace()
     # store
-    with open(output_file_path, "w") as f:
-        json.dump(processed_data, f)
+    p.dump(output_file_path)
 
 
 
@@ -349,13 +381,10 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser()
-
     parser.add_argument(
         "--diff",
-        "-d",
-        type=str,
-        nargs=2,
-        help="Two json traces to compare with",
+        nargs=4,
+        help="Two json traces to compare with, specified as <file1> <nruns1> <file2> <nruns2>",
     )
     parser.add_argument(
         "--augment_trace",
@@ -365,14 +394,26 @@ def main() -> None:
         metavar=("input_file", "output_file"),
         help="Augment a trace with inductor meta information. Provide input and output file paths.",
     )
-
+    parser.add_argument(
+        "--analysis",
+        nargs=2,
+        help="Run analysis on a single trace, specified as <file> <nruns>",
+    )
     args = parser.parse_args()
 
     if args.diff:
-        diff_profiles(args.diff[0], args.diff[1])
-
-    if args.augment:
-        augment_trace_with_inductor_meta(args.augment[0], args.augment[1])
+        # todo add name to diff
+        p1 = JsonProfile(args.diff[0], int(args.diff[1]))
+        p1.augment_trace()
+        p2 = JsonProfile(args.diff[2], int(args.diff[3]))
+        p2.augment_trace()
+        print(p1.report(p2))
+    if args.analysis:
+        p1 = JsonProfile(args.analysis[0], args.analysis[1])
+        p1.augment_trace()
+        print(p1.report())
+    if args.augment_trace:
+        _augment_trace_with_inductor_meta(args.augment[0], args.nruns, args.augment[1])
 
 
 if __name__ == "__main__":
