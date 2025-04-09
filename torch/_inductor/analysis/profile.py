@@ -9,6 +9,7 @@ import torch
 from torch.autograd import DeviceType
 from torch.utils._ordered_set import OrderedSet
 from torch.utils.flop_counter import flop_registry
+from tabulate import tabulate
 
 
 
@@ -32,7 +33,7 @@ class ProfileEvent:
 # adapters convert the json trace into a format that works with flops_counter
 adapters_map: dict[str, Any] = {}
 
-def register_adapter(aten: str | list[str]):
+def register_adapter(aten: Union[str, list[str]]):
     def decorator(func):
         global _adapters_map
         def wrapper(*args, **kwargs):
@@ -155,14 +156,14 @@ class KernelStats:
     achieved_flops: float
     achieved_bandwidth: float
 KernelNameMap = defaultdict[str, OrderedSet[KernelStats]]
-DeviceMap = dict[int, Device]
-Table = list
 @dataclass(frozen=False)
 class Device:
     name: str
     index: int
     info: DeviceInfo
     stats: KernelNameMap
+DeviceMap = dict[int, Device]
+Table = tabulate
 class JsonProfile:
     """operations on json perfetto traces"""
     _devices: DeviceMap
@@ -210,7 +211,7 @@ class JsonProfile:
         raise RuntimeError(f"Unknown type: {ret_type}. Please add to _dtype_map.")
 
     def _create_devices(self):
-        self._devices = {dev["id"]: Device(dev["name"], dev["id"], lookup_device_info(dev["name"]), {}) for dev in self.data["deviceProperties"]}
+        self._devices = {dev["id"]: Device(dev["name"], dev["id"], lookup_device_info(dev["name"]), defaultdict(OrderedSet)) for dev in self.data["deviceProperties"]}
 
     def calculate_flops(self, event: dict[str, Any]) -> int:
         return _calculate_flops(event)
@@ -255,23 +256,32 @@ class JsonProfile:
         pass
 
     def report(self, other: Optional["JsonProfile"] = None) -> str:
+        if other is not None:
+            self._compute_stats()
+            other._compute_stats()
+
+            self_tables = self._create_tables(self._devices)
+            other_tables = self._create_tables(other._devices)
+            indicies1 = OrderedSet(self._devices.keys())
+            indicies2 = OrderedSet(other._devices.keys())
+            combined_tables: dict[int, Table] = {}
+            for comb_index in indicies1 | indicies2:
+                combined_tables[comb_index] = self._combine_tables(self_tables[comb_index], other_tables[comb_index])
+            for comb_index in indicies1 - indicies2:
+                combined_tables[comb_index] = self_tables[comb_index]
+            for comb_index in indicies2 - indicies1:
+                combined_tables[comb_index] = other_tables[comb_index]
+
+            ret = []
+            for idx, table in combined_tables.items():
+                ret.append(f"Device {idx}:\n{table}")
+            return "\n".join(ret)
         self._compute_stats()
-        other._compute_stats()
 
         self_tables = self._create_tables(self._devices)
-        other_tables = self._create_tables(other._devices)
-        indices1 = OrderedSet(self._devices.keys())
-        indices2 = OrderedSet(other._devices.keys())
-        combined_tables: dict[int, Table] = {}
-        for comb_index in indicies1 | indicies2:
-            combined_tables[comb_index] = self._combine_tables(self_tables[comb_index], other_tables[comb_index])
-        for comb_index in indicies1 - indicies2:
-            combined_tables[comb_index] = self_tables[comb_index]
-        for comb_index in indicies2 - indicies1:
-            combined_tables[comb_index] = other_tables[comb_index]
 
         ret = []
-        for idx, table in combined_tables.items():
+        for idx, table in self_tables.items():
             ret.append(f"Device {idx}:\n{table}")
         return "\n".join(ret)
         #print(tabulate(table, headers=headers, tablefmt="grid"))
@@ -289,7 +299,6 @@ def parse_profile_event_list(
     nruns: int,
     device_name: str,
 ) -> None:
-    # breakpoint()
     def get_self_device_time(
         ev: torch.autograd.profiler_util.EventList,
     ) -> float:
@@ -312,7 +321,6 @@ def parse_profile_event_list(
         )
         all_events[category].append(profile_ev)
 
-    #breakpoint()
     for ev in event_list:
         assert not ev.is_legacy, "Don't support the legacy profiler"
         if ev.device_type == DeviceType.CPU:
