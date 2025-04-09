@@ -117,6 +117,9 @@ def omni_model(device, dtype):
         # Convolution operation
         conv_output = F.conv2d(input_conv, conv_weight)
         
+        # a pointwise op
+        conv_output = conv_output * 10
+        
         # Matrix multiplication (addmm) operation
         addmm_output = torch.addmm(torch.zeros(2, 4, device=mat1.device, dtype=mat1.dtype), mat1, mat2)
         
