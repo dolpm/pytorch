@@ -3,7 +3,7 @@ import math
 import tempfile
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Union, Optional
+from typing import Any, Union, Optional, Sequence
 
 import torch
 from torch.autograd import DeviceType
@@ -11,14 +11,11 @@ from torch.utils._ordered_set import OrderedSet
 from torch.utils.flop_counter import flop_registry
 
 
-@dataclass(frozen=True)
-class KernelStats:
-    flops: int
-    bw: float
 
 
 PROFILE_DIR = tempfile.gettempdir()
 PROFILE_PATH = f"{PROFILE_DIR}/compiled_module_profile.json"
+ATEN_PREFIX = "aten::"
 
 
 @dataclass
@@ -31,7 +28,6 @@ class ProfileEvent:
     count: float
 
 
-KernelNameMap = defaultdict[str, OrderedSet[KernelStats]]
 
 # adapters convert the json trace into a format that works with flops_counter
 adapters_map: dict[str, Any] = {}
@@ -44,17 +40,17 @@ def register_adapter(aten: str | list[str]):
             return result
 
         if isinstance(aten, str):
-            _adapters_map[aten] = wrapper
+            adapters_map[aten] = wrapper
         else:
             for at in aten:
-                _adapters_map[at] = wrapper
+                adapters_map[at] = wrapper
         return wrapper
     return decorator
 
 @register_adapter(["convolution", "_convolution"])
 def conv_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
     tmp = list(shapes)
-    tmp[6] = bool(concrete[6])
+    tmp[6] = bool(tmp[6])
     return tuple(tmp), {}
 
 
@@ -80,21 +76,9 @@ def baddbmm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any
 def mm_adapter(shapes: tuple[Any], concrete: tuple[Any]) -> tuple[tuple[Any], dict[Any, Any]]:
     return shapes, {}
 
-def _augment_trace_helper(data: dict[str, Any], nruns: int) -> dict[str, Any]:
-    ATEN_PREFIX = "aten::"
-    get_kernels(data) 
-
-    for event in data["traceEvents"]:
-        if "name" not in event:
-            raise ParseException("no name element in event")
-        name = event["name"]
-        if name.startswith(ATEN_PREFIX):
-            event["args"]["kernel_flops"] = calculate_flops(event)
-            event["args"]["kernel_bandwidth_estimate"] = estimate_bandwidth(event)
-    return data
 
 def _calculate_flops(event: dict[str, Any]) -> int:
-    op_name = name[len(ATEN_PREFIX) :]
+    op_name = event["name"][len(ATEN_PREFIX):]
     op_obj = getattr(torch.ops.aten, op_name)
     if not op_obj in flop_registry:
         return 0
@@ -109,7 +93,7 @@ def _calculate_flops(event: dict[str, Any]) -> int:
         breakpoint()
         args, kwargs = default_adapter(input_shapes, concrete)
     return flop_function(*args, **kwargs)
-def estimate_bandwidth(event: dict[str, Any]) -> float:
+def _estimate_bandwidth(event: dict[str, Any]) -> float:
     """
     This estimate isn't the best because it doesn't know if two input buffers are the same buffer, leading to an
     overestimate of the real achieved bandwidth.
@@ -126,16 +110,107 @@ def estimate_bandwidth(event: dict[str, Any]) -> float:
         except:
             breakpoint()
     return bw
+
+def _augment_trace_helper(data: dict[str, Any], nruns: int) -> dict[str, Any]:
+    for event in data["traceEvents"]:
+        if "name" not in event:
+            raise ParseException("no name element in event")
+        name = event["name"]
+        if name.startswith(ATEN_PREFIX):
+            event["args"]["kernel_flops"] = _calculate_flops(event)
+            event["args"]["kernel_bandwidth_estimate"] = _estimate_bandwidth(event)
+    return data
+
+@dataclass(frozen=True)
+class DeviceInfo:
+    flops: dict[torch.dtype, int]
+    dram_bw: float
+    
+
+_device_mapping: dict[str, DeviceInfo] = {
+    "Nvidia H100": DeviceInfo({}, 10)
+}
+def lookup_device_info(name: str) -> "DeviceInfo":
+    """
+    problem: when diffing profiles between amd and nvidia, we don't have access to the device information
+    of the other one. Also, since the analysis is static, we should be able to do it on another device unrelated
+    to the recorded device.
+    """
+    if name not in _device_mapping:
+        raise RuntimeError(f"Unsupported device in profile: {name}, if it's a more obscure device, consider contributing to _device_mapping.")
+    return _device_mapping[name]
+
+_dtype_map = {
+    "float": torch.float,
+    "int": torch.int,
+    "long": torch.long,
+    "long int": torch.long,
+}
+
+@dataclass(frozen=True)
+class KernelStats:
+    flops: int
+    bw: float
+    latency: float
+    achieved_flops: float
+    achieved_bandwidth: float
+KernelNameMap = defaultdict[str, OrderedSet[KernelStats]]
+DeviceMap = dict[int, Device]
+Table = list
+@dataclass(frozen=False)
+class Device:
+    name: str
+    index: int
+    info: DeviceInfo
+    stats: KernelNameMap
 class JsonProfile:
-    """operations on json traces"""
-    _stats: KernelNameMap
-    def __init__(self, path: str, nruns: int, device_name: Optional[str] = None, benchmark_name: Optinal[str] = None):
+    """operations on json perfetto traces"""
+    _devices: DeviceMap
+    def __init__(self, path: str, nruns: int, device_name: Optional[str] = None, benchmark_name: Optional[str] = None):
         self.path = path
         with open(path) as f:
             self.data = json.load(f)
+            self.events = self.data["traceEvents"]
         self.nruns = nruns
         self.device_name = device_name
         self.benchmark_name = benchmark_name
+        self._create_devices()
+
+    def convert_dtype(self, input_sizes: list[str], input_types: list[str], concrete_inputs: list[str]) -> torch.dtype:
+        """
+        Each op has a list of dtypes for each input arg. We need to convert these into a single dtype for flop estimation.
+        Issues:
+         - converting the strings to concrete torch.dtypes
+         - What if we have float32, float, float16 all in the inputs? Our choice is to use the largest buffer dtype.
+        """
+        assert len(input_sizes) == len(input_types)
+        assert len(input_types) == len(concrete_inputs)
+        if len(input_sizes) == 0:
+            raise RuntimeError("Empty input_sizes and input_types")
+
+        def parse_list(lst: str) -> list[int]:
+            lst = lst.replace('[', '').replace(']', '')
+            substrings = lst.split(',')
+            return [int(substring.strip()) for substring in substrings]
+
+        biggest_size = 0
+        biggest_index = 0
+        for i in range(len(input_sizes)):
+            if concrete_inputs[i] != "":
+                # concrete inputs are usually small tensors, so we can just skip
+                continue
+            my_size = input_sizes[i]
+            total_size = sum(parse_list(my_size))
+            if total_size > biggest_size:
+                biggest_size = total_size
+                biggest_index = i
+        ret_type = input_types[biggest_index]
+        if ret_type in _dtype_map:
+            return _dtype_map[ret_type]
+        raise RuntimeError(f"Unknown type: {ret_type}. Please add to _dtype_map.")
+
+    def _create_devices(self):
+        self._devices = {dev["id"]: Device(dev["name"], dev["id"], lookup_device_info(dev["name"]), {}) for dev in self.data["deviceProperties"]}
 
     def calculate_flops(self, event: dict[str, Any]) -> int:
         return _calculate_flops(event)
@@ -146,70 +221,64 @@ class JsonProfile:
         overestimate of the real achieved bandwidth.
         """
         return _estimate_bandwidth(event)
+
     def augment_trace(self) -> None:
         self.data = _augment_trace_helper(self.data, self.nruns)
-    def _compute_events(self) -> None:
-        pass
+
     def _compute_stats(self) -> None:
         """populates the name -> stats map"""
-        if self._stats is not None:
-            name_map: KernelNameMap = defaultdict(OrderedSet)
-            for event in data["traceEvents"]:
-                if (
-                    "args" in event
-                    and "kernel_flops" in event["args"]
-                    and "kernel_bandwidth" in event["args"]
-                ):
-                    name_map[event["name"]].add(
-                        KernelStats(
-                            event["args"]["kernel_flops"], event["args"]["kernel_bandwidth"]
-                        )
-                    )
-            self._stats
+        for event in self.events:
+            if (
+                "args" in event
+                and event["cat"] == "kernel"
+                and "kernel_flops" in event["args"]
+                and "kernel_bandwidth" in event["args"]
+            ):
+                dev = self._devices[event["args"]["device"]]
+                latency = event["dur"]
+                op_bw = event["args"]["kernel_bandwidth"]
+                op_flops = event["args"]["kernel_flops"]
+                dtype = self.convert_dtype(event["args"]["Input Dims"], event["args"]["Input type"], event["args"]["Concrete Inputs"])
+                
+                # TODO check units here
+                # TODO this formula is wrong
+                achieved_bandwidth =  op_bw * latency / dev.info.dram_bw
+                achieved_flops = op_flops * latency / dev.info.flops[dtype]
+                dev.stats[event["name"]].add(KernelStats(op_flops, op_bw, latency, achieved_bandwidth, achieved_flops))
+    def _create_single_table(self, dev: Device) -> Table:
+        """create a table with the devices mapped to indicies"""
+        pass
+
+    def _create_tables(self, devs: DeviceMap) -> dict[int, Table]:
+        return {idx: self._create_single_table(dev) for idx, dev in devs.items()} 
+    def _combine_tables(self, table1: Table, table2: Table) -> Table:
+        pass
+
     def report(self, other: Optional["JsonProfile"] = None) -> str:
         self._compute_stats()
-        self._compute_events()
-        def combine_name_maps(
-            filename1: str,
-            name_map1: KernelNameMap,
-            filename2: str,
-            name_map2: KernelNameMap,
-        ) -> None:
-            from tabulate import tabulate
+        other._compute_stats()
 
-            combined_table = {}
+        self_tables = self._create_tables(self._devices)
+        other_tables = self._create_tables(other._devices)
+        indices1 = OrderedSet(self._devices.keys())
+        indices2 = OrderedSet(other._devices.keys())
+        combined_tables: dict[int, Table] = {}
+        for comb_index in indicies1 | indicies2:
+            combined_tables[comb_index] = self._combine_tables(self_tables[comb_index], other_tables[comb_index])
+        for comb_index in indicies1 - indicies2:
+            combined_tables[comb_index] = self_tables[comb_index]
+        for comb_index in indicies2 - indicies1:
+            combined_tables[comb_index] = other_tables[comb_index]
 
-            # Get all unique names from both name maps
-            all_names = OrderedSet(list(name_map1.keys()) + list(name_map2.keys()))
+        ret = []
+        for idx, table in combined_tables.items():
+            ret.append(f"Device {idx}:\n{table}")
+        return "\n".join(ret)
+        #print(tabulate(table, headers=headers, tablefmt="grid"))
 
-            for name in all_names:
-                stats1 = name_map1.get(name, OrderedSet())
-                stats2 = name_map2.get(name, OrderedSet())
-
-                flops_avg1 = (
-                    sum(stat.flops for stat in stats1) / len(stats1) if stats1 else 0
-                )
-                bw_avg1 = sum(stat.bw for stat in stats1) / len(stats1) if stats1 else 0
-
-                flops_avg2 = (
-                    sum(stat.flops for stat in stats2) / len(stats2) if stats2 else 0
-                )
-                bw_avg2 = sum(stat.bw for stat in stats2) / len(stats2) if stats2 else 0
-
-                combined_table[name] = [flops_avg1, bw_avg1, flops_avg2, bw_avg2]
-
-            headers = [
-                "Kernel Name",
-                f"{filename1} FLOPS",
-                f"{filename1} Bandwidth",
-                f"{filename2} FLOPS",
-                f"{filename2} Bandwidth",
-            ]
-            table = [[name] + values for name, values in combined_table.items()]
-            print(tabulate(table, headers=headers, tablefmt="grid"))
     def dump(self, out: str) -> None:
         with open(out, "w") as f:
-            json.dump(processed_data, f)
+            json.dump(self.data, f)
 
 
 
@@ -346,7 +415,7 @@ class ParseException(RuntimeError):
     pass
 
 
-def flatten(lst: list[Union[int, list[int]]]) -> list[int]:
+def flatten(lst: Sequence[Union[int, Sequence[int]]]) -> Sequence[int]:
     """Flatten a nested list of integers."""
     flat_list = []
     for item in lst:
@@ -355,10 +424,6 @@ def flatten(lst: list[Union[int, list[int]]]) -> list[int]:
         else:
             flat_list.append(item)
     return flat_list
-
-def get_kernels(data: dict[str, Any]) -> dict[str, list[ProfileEvent]]:
-    #breakpoint()
-    pass
 
 
 def _augment_trace_with_inductor_meta(
