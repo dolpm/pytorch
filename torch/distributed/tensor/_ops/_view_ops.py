@@ -15,7 +15,6 @@ from torch.distributed.tensor._op_schema import (
     StrategyType,
 )
 from torch.distributed.tensor._ops.utils import (
-    generate_redistribute_costs,
     normalize_dim,
     normalize_dims,
     prod,
@@ -470,9 +469,10 @@ dim_maps: dict[Callable[..., torch.Tensor], Callable[..., DimMap]] = {
 
 def propagate_shape_and_sharding(
     input_src_placements: Sequence[Placement],
-    local_in_shape: Shape,
+    global_input_shape: Shape,
     rule: DimMap,
     mesh_sizes: Shape,
+    strict_view: bool = False,
 ) -> tuple[Sequence[Placement], Sequence[Placement]]:
     """
     Determine input target sharding and output sharding based on
@@ -502,17 +502,59 @@ def propagate_shape_and_sharding(
 
     for cmd in rule:
         collect_used_inputs(cmd)
-    for dim in range(len(local_in_shape)):
+    for dim in range(len(global_input_shape)):
         shardable_dims[dim] = [dim in seen_input_dims] * mesh_ndim
 
+    def is_sharded(input_dim: InputDim) -> bool:
+        for placement in input_src_placements:
+            if isinstance(placement, Shard) and placement.dim == input_dim:
+                return True
+        return False
+
+    def get_shard_mesh_dim_and_placement(
+        input_dim: InputDim,
+    ) -> tuple[int, Shard]:
+        # if input_dim is sharded, return the mesh_dim and shard placement
+        for i, placement in enumerate(input_src_placements):
+            if isinstance(placement, Shard) and placement.dim == input_dim:
+                return i, placement
+        raise RuntimeError("input_dim is not sharded")
+
     def get_in_dim_to_shard(cmd: DimSpec) -> Optional[InputDim]:
+        # TODO(whc) this helper is pretty hard to understand, at least it should be better documented if not refactored
         if isinstance(cmd, InputDim):
             return cmd
         elif isinstance(cmd, Flatten):
-            for dim in cmd.input_dims[1:]:
+            for i, dim in enumerate(cmd.input_dims):
                 if isinstance(dim, InputDim):
-                    shardable_dims[dim.input_dim] = [False] * mesh_ndim
+                    can_shard_dim = True
+                    input_sharded = is_sharded(dim)
+                    if i > 0:
+                        can_shard_dim = False
+                        if strict_view and input_sharded:
+                            raise RuntimeError(
+                                f"Attempted to flatten sharded dimension {i}, ",
+                                "but only the leftmost dim of a Flatten can be sharded.",
+                            )
+                    elif input_sharded:
+                        shard_mesh_dim, shard_placement = (
+                            get_shard_mesh_dim_and_placement(dim)
+                        )
+                        tensor_dim_size = global_input_shape[shard_placement.dim]
+                        mesh_dim_size = mesh_sizes[shard_mesh_dim]
+                        if tensor_dim_size % mesh_dim_size != 0:
+                            can_shard_dim = False
+                            if strict_view:
+                                raise RuntimeError(
+                                    f"Attempted to flatten unevenly sharded dimension {i}, "
+                                    "which would require resharding the input. "
+                                    "Please explicitly redistribute the tensor instead."
+                                )
+
+                    shardable_dims[dim.input_dim] = [can_shard_dim] * mesh_ndim
             dim0 = cmd.input_dims[0]
+            # TODO(whc) dim0 can be sharded or not sharded, can't it?
+            # should we only return it if its sharded in the placement?
             return dim0 if isinstance(dim0, InputDim) else None
         elif isinstance(cmd, Split):
             in_dim = get_in_dim_to_shard(cmd.input_dim)
@@ -576,7 +618,17 @@ def register_op_strategy_map(
     aten_op_overload: torch._ops.OpOverload,
     local_op_name: Callable[..., torch.Tensor],
     schema_info: Optional[RuntimeSchemaInfo] = None,
+    strict_view: bool = False,
 ) -> None:
+    """
+    Helper that registers strategies for view-like operators that follow a pattern:
+      (1) define the way input dims are split/combined to form output dims (dim_maps)
+      (2) register a strategy for the op schema that uses the dim_map as a sharding prop rule
+
+    strict_view: if True, we will error out if the view-operation would require resharding the input.
+       Currently, this should be set to 'true' for any "view" ops.
+       We could diverge behavior for "reshape" ops which could perform a redistribute implicitly.
+    """
     dim_map: Callable[..., DimMap] = dim_maps[local_op_name]
 
     @register_op_strategy(aten_op_overload, schema_info=schema_info)
@@ -597,6 +649,7 @@ def register_op_strategy_map(
                 tuple(global_in_shape),
                 rules,
                 mesh.shape,
+                strict_view,
             )
 
             # TODO: optimize this. we shouldn't simply blindly replicate
@@ -608,10 +661,11 @@ def register_op_strategy_map(
                 mesh=mesh,
                 tensor_meta=input_src_spec.tensor_meta,
             )
-            redistribute_costs = [
-                generate_redistribute_costs(input_strategy, input_tgt_spec)
-            ]
+            redistribute_costs: list[list[float]] = []
 
+            # TODO(whc) should attach propagated tensor_meta.
+            # we now compute the new shape,
+            # so maybe its as simple as copying the rest of tensor_meta from old tensor and changing the shape?
             output_spec = DTensorSpec(mesh=mesh, placements=tuple(output_placements))
             output_strategy.strategies.append(
                 PlacementStrategy(
@@ -629,13 +683,19 @@ register_op_strategy_map(
     aten.squeeze.dim, torch.squeeze, schema_info=RuntimeSchemaInfo(1)
 )
 register_op_strategy_map(
-    aten.view.default, Tensor.view, schema_info=RuntimeSchemaInfo(1)
+    aten.view.default,
+    Tensor.view,
+    schema_info=RuntimeSchemaInfo(1),
+    strict_view=True,
 )
 register_op_strategy_map(
     aten.reshape.default, torch.reshape, schema_info=RuntimeSchemaInfo(1)
 )
 register_op_strategy_map(
-    aten._unsafe_view.default, Tensor.view, schema_info=RuntimeSchemaInfo(1)
+    aten._unsafe_view.default,
+    Tensor.view,
+    schema_info=RuntimeSchemaInfo(1),
+    strict_view=True,
 )
 register_op_strategy_map(
     aten.unsqueeze.default, torch.unsqueeze, schema_info=RuntimeSchemaInfo(1)
