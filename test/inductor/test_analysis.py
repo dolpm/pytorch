@@ -9,7 +9,11 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 import torch.utils.flop_counter
-from torch._inductor.analysis.profile_analysis import _augment_trace_helper, main
+from torch._inductor.analysis.profile_analysis import (
+    _augment_trace_helper,
+    JsonProfile,
+    main,
+)
 from torch._inductor.utils import flatten, tabulate_2d, zip_dicts
 from torch.testing._internal.common_device_type import (
     dtypes,
@@ -297,10 +301,44 @@ class TestAnalysis(TestCase):
             om()
         trace1, trace2 = trace_files()
         p.export_chrome_trace(trace1)
-        # patch('sys.stdout', new_callable=StringIO) as mock_stdout,
         with patch("sys.argv", [*prefix, "--augment_trace", trace1, trace2]):
             main()
-            # self.assertEqual(mock_stdout.getvalue(), "")
+        profile = JsonProfile(trace2, 1, "foo")
+        rep = profile.report()
+        # If these fail, just update them. They could change over time
+        if device != "cpu":
+            self.assertTrue(len(rep.split("\n")) > 4)
+        self.assertIn("Kernel Name", rep)
+        self.assertIn("Kernel Count", rep)
+        self.assertIn("FLOPS", rep)
+        self.assertIn("bw gbps", rep)
+        self.assertIn("Dur (ms)", rep)
+        self.assertIn("Achieved", rep)
+        self.assertIn("|", rep)
+        self.assertIn("-----", rep)
+
+        # TODO we need a robust way of checking this report.
+        # In the mean time, make sure that no column is empty.
+        # TODO check to make sure all % values are less than 100%
+        tables = profile._create_tables(profile._devices)
+        for tab in tables.values():
+            header, rows = tab
+            ncols = len(header) - 1
+            seen = [False] * ncols
+            for row in rows.values():
+                for i in range(len(row)):
+                    try:
+                        val = float(row[i])
+                    except Exception:
+                        continue
+                    seen[i] = seen[i] or (val != 0.0)
+
+            if device != "cpu":
+                for i in range(len(seen)):
+                    self.assertTrue(
+                        seen[i],
+                        f"column values from column {i + 1} with header '{header[i + 1]}' are all zero",
+                    )
 
     @dtypes(torch.float, torch.double)
     def test_augment_trace_against_flop_counter(self, device, dtype):

@@ -160,7 +160,7 @@ def _estimate_gb(event: dict[str, Any]) -> float:
     This estimate isn't the best because it doesn't know if two input buffers are the same buffer, leading to an
     overestimate of the real achieved bandwidth.
     """
-    if "Input Type" not in event["args"] or "Input Dims" not in event["args"]:
+    if "Input type" not in event["args"] or "Input Dims" not in event["args"]:
         return 0
     sizes_and_types = zip(event["args"]["Input Dims"], event["args"]["Input type"])
     bw = 0
@@ -386,7 +386,7 @@ class JsonProfile:
                     achieved_flops = 0
                 else:
                     dtype = self.convert_dtype(event)
-                    achieved_flops = op_flops / (1e12 * dev.info.tflops[dtype])
+                    achieved_flops = 100 * op_flops / (1e12 * dev.info.tflops[dtype])
             else:
                 op_flops = 0
                 achieved_flops = 0
@@ -395,7 +395,7 @@ class JsonProfile:
                 assert dur != 0
                 # 1000ms/s * gb / ms = gb/s
                 op_gbps = 1e3 * event["args"]["kernel_num_gb"] / dur
-                achieved_bandwidth = op_gbps / dev.info.dram_bw_gbs
+                achieved_bandwidth = 100 * op_gbps / dev.info.dram_bw_gbs
             else:
                 op_gbps = 0
                 achieved_bandwidth = 0
@@ -534,7 +534,7 @@ class JsonProfile:
 
 def parse_profile_event_list(
     benchmark_name: str,
-    event_list: torch.autograd.profiler_util.EventList | dict[str, Any],
+    event_list: Union[torch.autograd.profiler_util.EventList, dict[str, Any]],
     wall_time_ms: float,
     nruns: int,
     device_name: str,
