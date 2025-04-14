@@ -91,6 +91,7 @@ from .utils import (
     ir_dataclass,
     is_dynamic,
     is_gpu,
+    set_kernel_post_grad_provenance_tracing,
     sympy_dot,
     sympy_index_symbol,
     sympy_index_symbol_with_prefix,
@@ -5798,6 +5799,11 @@ class ExternKernelOut(ExternKernel):
         else:
             kernel_name = self.get_kernel_name()
         device = d.type if (d := self.get_device()) else V.graph.device_type
+
+        # set provenance tracing kernel mapping for ExternKernel types
+        if config.trace.enabled:
+            set_kernel_post_grad_provenance_tracing(self, kernel_name, is_extern=True)
+
         wrapper.generate_extern_kernel_out(
             kernel_name,
             self.codegen_reference(),
