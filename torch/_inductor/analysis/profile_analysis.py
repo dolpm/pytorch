@@ -8,10 +8,8 @@ from dataclasses import dataclass
 from logging import info
 from typing import Any, Optional, Union
 
-from tabulate import tabulate
-
 import torch
-from torch._inductor.utils import get_device_tflops, get_gpu_dram_gbps
+from torch._inductor.utils import get_device_tflops, get_gpu_dram_gbps, tabulate_2d
 from torch.autograd import DeviceType
 from torch.utils._ordered_set import OrderedSet
 from torch.utils.flop_counter import flop_registry
@@ -503,7 +501,7 @@ class JsonProfile:
                 [kernel_name[:name_limit], *kernel_vals]
                 for kernel_name, kernel_vals in table_rows.items()
             ]
-            return tabulate(table_flattened, headers=table_headers)
+            return tabulate_2d(table_flattened, headers=table_headers)
 
         if other is not None:
             self._compute_stats()
@@ -540,7 +538,6 @@ class JsonProfile:
             tab_string = create_ret(table_headers, table_rows)
             ret.append(f"{self._devices[idx]}:\n{tab_string}")
         return "\n".join(ret)
-        # print(tabulate(table, headers=headers, tablefmt="grid"))
 
     def dump(self, out: str) -> None:
         with open(out, "w") as f:

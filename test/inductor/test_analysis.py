@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 import torch.utils.flop_counter
 from torch._inductor.analysis.profile_analysis import _augment_trace_helper, main
+from torch._inductor.utils import tabulate_2d
 from torch.testing._internal.common_device_type import (
     dtypes,
     instantiate_device_type_tests,
@@ -185,6 +186,30 @@ def omni_model(device, dtype):
 
 
 prefix = ["profile.py"]
+
+
+class TestTabulate2D(TestCase):
+    def test_tabulate2d(self):
+        headers = ["Kernel", "Self H100 TIME (ms)", "Count", "Percent"]
+        rows = [
+            ["aten::mm", 0.000, 1, 0.0],
+            ["aten::bmm", 0.000, 1, 0.0],
+            ["aten::baddbmm", 0.000, 1, 0.0],
+            ["aten::convolution", 0.000, 1, 0.0],
+            ["aten::cudnn_convolution", 0.000, 1, 0.0],
+        ]
+        table = [
+            " Kernel                  | Self H100 TIME (ms) | Count | Percent ",
+            "-----------------------------------------------------------------",
+            " aten::mm                |                 0.0 |     1 |     0.0 ",
+            " aten::bmm               |                 0.0 |     1 |     0.0 ",
+            " aten::baddbmm           |                 0.0 |     1 |     0.0 ",
+            " aten::convolution       |                 0.0 |     1 |     0.0 ",
+            " aten::cudnn_convolution |                 0.0 |     1 |     0.0 ",
+        ]
+        res = tabulate_2d(rows, headers)
+        for r, t in zip(res.split("\n"), table):
+            self.assertEqual(r, t)
 
 
 class TestAnalysis(TestCase):
