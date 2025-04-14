@@ -176,8 +176,6 @@ def perf_profile(
     )
 
 
-
-
 def ncu_analyzer(
     benchmark_name: str, benchmark_compiled_module_fn: BenchmarkCallableType
 ) -> None:
@@ -228,6 +226,7 @@ def ncu_analyzer(
     except subprocess.CalledProcessError as e:
         print(f"NCU profiling failed with error: {e}")
         return
+
 
 def collect_memory_snapshot(
     benchmark_compiled_module_fn: BenchmarkCallableType,

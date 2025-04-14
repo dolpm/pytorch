@@ -3,13 +3,18 @@ import logging
 import math
 import tempfile
 from collections import defaultdict
-from collections.abc import Generator, Sequence
 from dataclasses import dataclass
 from logging import info
 from typing import Any, Optional, Union
 
 import torch
-from torch._inductor.utils import get_device_tflops, get_gpu_dram_gbps, tabulate_2d
+from torch._inductor.utils import (
+    flatten,
+    get_device_tflops,
+    get_gpu_dram_gbps,
+    tabulate_2d,
+    zip_dicts,
+)
 from torch.autograd import DeviceType
 from torch.utils._ordered_set import OrderedSet
 from torch.utils.flop_counter import flop_registry
@@ -41,32 +46,6 @@ def parse_list(lst: str) -> list[int]:
     lst = lst.replace("[", "").replace("]", "")
     substrings = lst.split(",")
     return [int(substring.strip()) for substring in substrings]
-
-
-def zip_dicts(
-    dict1: dict[Any, Any], dict2: dict[Any, Any], default: Any = None
-) -> Generator[tuple[Any, Any, Any], None, None]:
-    """
-    Zip two dictionaries together, indicating missing keys.
-
-    Args:
-        dict1 (dict): The first dictionary.
-        dict2 (dict): The second dictionary.
-        default (Any):
-
-    Yields:
-        tuple: A tuple containing the key, the value from dict1 (or None if missing), and the value from dict2 (or None if missing).
-    """
-    # Find the union of all keys
-    all_keys = OrderedSet(dict1.keys()) | OrderedSet(dict2.keys())
-
-    # Iterate over all keys
-    for key in all_keys:
-        # Get the values from both dictionaries, or None if missing
-        value1 = dict1.get(key, default)
-        value2 = dict2.get(key, default)
-
-        yield key, value1, value2
 
 
 def register_adapter(aten: Union[str, list[str]]):  # type: ignore[no-untyped-def]
@@ -101,7 +80,7 @@ def conv_adapter(
     kwargs = {}
     if not transposed:
         # calculate output shape if not transposed.
-        def conv_out_dims(x, kernel, stride):
+        def conv_out_dims(x: int, kernel: int, stride: int) -> int:
             return (x - kernel) // stride + 1
 
         stride = parse_list(concrete[3])
@@ -196,7 +175,7 @@ def _estimate_gb(event: dict[str, Any]) -> float:
 
 def _augment_trace_helper(data: dict[str, Any]) -> dict[str, Any]:
     # compute a mapping from exteral ids to non kernels, which contain the information we need to estimate flops etc
-    extern_mapping = defaultdict(list)
+    extern_mapping: defaultdict[int, list[dict[str, Any]]] = defaultdict(list)
     for event in data["traceEvents"]:
         if (
             "args" not in event
@@ -296,7 +275,7 @@ class Device:
     info: DeviceInfo
     stats: KernelNameMap
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Device({self.name}, {self.index})"
 
 
@@ -323,7 +302,7 @@ class JsonProfile:
         self.benchmark_name = benchmark_name
         self._create_devices()
 
-    def convert_dtype(self, event) -> torch.dtype:
+    def convert_dtype(self, event: dict[str, Any]) -> torch.dtype:
         """
         Each op has a list of dtypes for each input arg. We need to convert these into a single dtype for flop estimation.
         Issues:
@@ -368,7 +347,7 @@ class JsonProfile:
             return _dtype_map[ret_type]
         raise RuntimeError(f"Unknown type: {ret_type}. Please add to _dtype_map.")
 
-    def _create_devices(self):
+    def _create_devices(self) -> None:
         self._devices = {
             dev["id"]: Device(
                 dev["name"],
@@ -448,11 +427,11 @@ class JsonProfile:
             ker_count = 0
             flops = 0
             flops_count = 0
-            achieved_flops = 0
-            bw = 0
+            achieved_flops = 0.0
+            bw = 0.0
             bw_count = 0
-            achieved_bandwidth = 0
-            latency = 0
+            achieved_bandwidth = 0.0
+            latency = 0.0
             for stats in stats_set:
                 if stats.flops != 0:
                     flops += stats.flops
@@ -487,16 +466,25 @@ class JsonProfile:
             + [f"{table1_name} {head}" for head in table1[0][1:]]
             + [f"{table2_name} {head}" for head in table2[0][1:]]
         )
+        t1_length = len(table1[0][1:])
+        t2_length = len(table2[0][1:])
         new_rows = {}
 
-        for key, row1, row2 in zip_dicts(table1[1], table2[1], default=(["Empty"] * 5)):
+        for key, row1, row2 in zip_dicts(
+            table1[1],
+            table2[1],
+            d1_default=["Empty"] * t1_length,
+            d2_default=["Empty"] * t2_length,
+        ):
             new_rows[key] = row1 + row2
         return new_headers, new_rows
 
     def report(
         self, other: Optional["JsonProfile"] = None, name_limit: int = 40
     ) -> str:
-        def create_ret(table_headers, table_rows):
+        def create_ret(
+            table_headers: list[str], table_rows: dict[str, list[str]]
+        ) -> str:
             table_flattened = [
                 [kernel_name[:name_limit], *kernel_vals]
                 for kernel_name, kernel_vals in table_rows.items()
@@ -520,7 +508,7 @@ class JsonProfile:
             ret = []
             assert self._devices.keys() == other._devices.keys()
             for device_idx, t1, t2 in zip_dicts(
-                self_tables, other_tables, default=None
+                self_tables, other_tables, d1_default=None, d2_default=None
             ):
                 table_headers, table_rows = self._combine_tables(
                     t1, self_name, t2, other_name
@@ -672,17 +660,6 @@ def parse_profile_event_list(
 
 class ParseException(RuntimeError):
     pass
-
-
-def flatten(lst: Sequence[Union[int, Sequence[int]]]) -> Sequence[int]:
-    """Flatten a nested list of integers."""
-    flat_list = []
-    for item in lst:
-        if isinstance(item, list):
-            flat_list.extend(flatten(item))
-        else:
-            flat_list.append(item)
-    return flat_list
 
 
 def main() -> None:

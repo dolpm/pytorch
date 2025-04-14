@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 import torch.utils.flop_counter
 from torch._inductor.analysis.profile_analysis import _augment_trace_helper, main
-from torch._inductor.utils import tabulate_2d
+from torch._inductor.utils import flatten, tabulate_2d, zip_dicts
 from torch.testing._internal.common_device_type import (
     dtypes,
     instantiate_device_type_tests,
@@ -45,21 +45,32 @@ example_profile = """
     "ph": "X", "cat": "cpu_op", "name": "aten::convolution", "pid": 1147039, "tid": 1147039,
     "ts": 198093488368.463, "dur": 425.453,
     "args": {
-      "External id": 1340,"Sequence number": 0, "Fwd thread id": 0, "Record function id": 0, "Concrete Inputs": ["", "", "", "[2, 2]", "[3, 3]", "[1, 1]", "False", "[0, 0]", "1"], "Input type": ["float", "float", "", "ScalarList", "ScalarList", "ScalarList", "Scalar", "ScalarList", "Scalar"], "Input Strides": [[150528, 1, 672, 3], [147, 1, 21, 3], [], [], [], [], [], [], []], "Input Dims": [[1, 3, 224, 224], [64, 3, 7, 7], [], [], [], [], [], [], []], "Ev Idx": 1339
+      "External id": 1340,"Sequence number": 0, "Fwd thread id": 0, "Record function id": 0, "Concrete Inputs": \
+["", "", "", "[2, 2]", "[3, 3]", "[1, 1]", "False", "[0, 0]", "1"], "Input type": ["float", "float", "", \
+"ScalarList", "ScalarList", "ScalarList", "Scalar", "ScalarList", "Scalar"], "Input Strides": [[150528, 1, 672, 3],\
+[147, 1, 21, 3], [], [], [], [], [], [], []], "Input Dims": [[1, 3, 224, 224], [64, 3, 7, 7], [], [], [], [], [], \
+[], []], "Ev Idx": 1339
     }
   },
   {
     "ph": "X", "cat": "cpu_op", "name": "aten::_convolution", "pid": 1147039, "tid": 1147039,
     "ts": 198093488444.498, "dur": 341.867,
     "args": {
-      "External id": 1341,"Record function id": 0, "Concrete Inputs": ["", "", "", "[2, 2]", "[3, 3]", "[1, 1]", "False", "[0, 0]", "1", "False", "False", "True", "True"], "Input type": ["float", "float", "", "ScalarList", "ScalarList", "ScalarList", "Scalar", "ScalarList", "Scalar", "Scalar", "Scalar", "Scalar", "Scalar"], "Input Strides": [[150528, 1, 672, 3], [147, 1, 21, 3], [], [], [], [], [], [], [], [], [], [], []], "Input Dims": [[1, 3, 224, 224], [64, 3, 7, 7], [], [], [], [], [], [], [], [], [], [], []], "Ev Idx": 1340
+      "External id": 1341,"Record function id": 0, "Concrete Inputs": ["", "", "", "[2, 2]", "[3, 3]", "[1, 1]",\
+ "False", "[0, 0]", "1", "False", "False", "True", "True"], "Input type": ["float", "float", "", "ScalarList",\
+ "ScalarList", "ScalarList", "Scalar", "ScalarList", "Scalar", "Scalar", "Scalar", "Scalar", "Scalar"], "Input Strides": \
+[[150528, 1, 672, 3], [147, 1, 21, 3], [], [], [], [], [], [], [], [], [], [], []], "Input Dims": [[1, 3, 224, 224], \
+[64, 3, 7, 7], [], [], [], [], [], [], [], [], [], [], []], "Ev Idx": 1340
     }
   },
   {
     "ph": "X", "cat": "cpu_op", "name": "aten::addmm", "pid": 1147039, "tid": 1147039,
     "ts": 198093513655.849, "dur": 251.130,
     "args": {
-      "External id": 1619,"Sequence number": 0, "Fwd thread id": 0, "Record function id": 0, "Concrete Inputs": ["", "", "", "1", "1", ""], "Input type": ["float", "float", "float", "Scalar", "Scalar", "float"], "Input Strides": [[1], [0, 1], [1, 2048], [], [], [1000, 1]], "Input Dims": [[1000], [1, 2048], [2048, 1000], [], [], [1, 1000]], "Ev Idx": 1618
+      "External id": 1619,"Sequence number": 0, "Fwd thread id": 0, "Record function id": 0, "Concrete Inputs": \
+["", "", "", "1", "1", ""], "Input type": ["float", "float", "float", "Scalar", "Scalar", "float"], "Input Strides":\
+ [[1], [0, 1], [1, 2048], [], [], [1000, 1]], "Input Dims": [[1000], [1, 2048], [2048, 1000], [], [], [1, 1000]], \
+"Ev Idx": 1618
     }
   },
   {
@@ -80,7 +91,11 @@ example_profile = """
     "ph": "X", "cat": "cpu_op", "name": "aten::convolution", "pid": 1147039, "tid": 1147039,
     "ts": 198093488444.498, "dur": 341.867,
     "args": {
-      "External id": 1342,"Record function id": 0, "Concrete Inputs": ["", "", "", "[2, 2]", "[3, 3]", "[1, 1]", "False", "[0, 0]", "1", "False", "False", "True", "True"], "Input type": ["float", "float", "", "ScalarList", "ScalarList", "ScalarList", "Scalar", "ScalarList", "Scalar", "Scalar", "Scalar", "Scalar", "Scalar"], "Input Strides": [[150528, 1, 672, 3], [147, 1, 21, 3], [], [], [], [], [], [], [], [], [], [], []], "Input Dims": [[1, 3, 224, 224], [64, 3, 7, 7], [], [], [], [], [], [], [], [], [], [], []], "Ev Idx": 1340
+      "External id": 1342,"Record function id": 0, "Concrete Inputs": ["", "", "", "[2, 2]", "[3, 3]", "[1, 1]", \
+"False", "[0, 0]", "1", "False", "False", "True", "True"], "Input type": ["float", "float", "", "ScalarList", \
+"ScalarList", "ScalarList", "Scalar", "ScalarList", "Scalar", "Scalar", "Scalar", "Scalar", "Scalar"], "Input \
+Strides": [[150528, 1, 672, 3], [147, 1, 21, 3], [], [], [], [], [], [], [], [], [], [], []], "Input Dims": \
+[[1, 3, 224, 224], [64, 3, 7, 7], [], [], [], [], [], [], [], [], [], [], []], "Ev Idx": 1340
     }
   }
 ],
@@ -188,7 +203,7 @@ def omni_model(device, dtype):
 prefix = ["profile.py"]
 
 
-class TestTabulate2D(TestCase):
+class TestUtils(TestCase):
     def test_tabulate2d(self):
         headers = ["Kernel", "Self H100 TIME (ms)", "Count", "Percent"]
         rows = [
@@ -211,12 +226,24 @@ class TestTabulate2D(TestCase):
         for r, t in zip(res.split("\n"), table):
             self.assertEqual(r, t)
 
+    def test_zip_dicts(self):
+        d1 = {"a": 1, "b": 2}
+        d2 = {"a": 3, "c": 4}
+        res = zip_dicts(d1, d2, d1_default="foo", d2_default="bar")
+        self.assertEqual(set(res), {("a", 1, 3), ("b", 2, "bar"), ("c", "foo", 4)})
+        res = zip_dicts(d1, d2)
+        self.assertEqual(set(res), {("a", 1, 3), ("b", 2, None), ("c", None, 4)})
+
+    def test_flatten(self):
+        t1 = [1, 2, [3, [4, 5, [6], 7], 8], 9]
+        self.assertEqual(flatten(t1), [1, 2, 3, 4, 5, 6, 7, 8, 9])
+
 
 class TestAnalysis(TestCase):
     def test_noop(self):
         with (
             patch("sys.stdout", new_callable=StringIO) as mock_stdout,
-            patch("sys.argv", [*prefix]) as mock_argv,
+            patch("sys.argv", [*prefix]),
         ):
             main()
             self.assertEqual(mock_stdout.getvalue(), "")
@@ -253,7 +280,7 @@ class TestAnalysis(TestCase):
                 "--name_limit",
                 "200",
             ],
-        ) as mock_argv:
+        ):
             main()
             # self.assertEqual(mock_stdout.getvalue(), "")
 
@@ -271,9 +298,7 @@ class TestAnalysis(TestCase):
         trace1, trace2 = trace_files()
         p.export_chrome_trace(trace1)
         # patch('sys.stdout', new_callable=StringIO) as mock_stdout,
-        with patch(
-            "sys.argv", [*prefix, "--augment_trace", trace1, trace2]
-        ) as mock_argv:
+        with patch("sys.argv", [*prefix, "--augment_trace", trace1, trace2]):
             main()
             # self.assertEqual(mock_stdout.getvalue(), "")
 
@@ -296,9 +321,7 @@ class TestAnalysis(TestCase):
         in_path = f"{PROFILE_DIR}/test_profile.json"
         out_path = f"{PROFILE_DIR}/out_profile.json"
         p.export_chrome_trace(in_path)
-        with patch(
-            "sys.argv", [*prefix, "--augment_trace", in_path, out_path]
-        ) as mock_argv:
+        with patch("sys.argv", [*prefix, "--augment_trace", in_path, out_path]):
             main()
 
         with open(out_path) as f:

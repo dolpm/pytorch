@@ -21,7 +21,14 @@ import tempfile
 import textwrap
 import time
 import unittest
-from collections.abc import Collection, Iterator, Mapping, MutableMapping, MutableSet
+from collections.abc import (
+    Collection,
+    Generator,
+    Iterator,
+    Mapping,
+    MutableMapping,
+    MutableSet,
+)
 from datetime import datetime
 from io import StringIO
 from typing import (
@@ -2772,3 +2779,45 @@ def tabulate_2d(elements: Sequence[Sequence[T]], headers: Sequence[T]) -> str:
     for row in elements:
         lines.append("|".join(f" {e:{w}} " for e, w in zip(row, widths)))
     return "\n".join(lines)
+
+
+def zip_dicts(
+    dict1: dict[Any, Any],
+    dict2: dict[Any, Any],
+    d1_default: Any = None,
+    d2_default: Any = None,
+) -> Generator[tuple[Any, Any, Any], None, None]:
+    """
+    Zip two dictionaries together, indicating missing keys.
+
+    Args:
+        dict1 (dict): The first dictionary.
+        dict2 (dict): The second dictionary.
+        d1_default (Any): the default value for the first dictionary
+        d2_default (Any): the default value for the second dictionary
+
+    Yields:
+        tuple: A tuple containing the key, the value from dict1 (or d1_default if missing),
+               and the value from dict2 (or d2_default if missing).
+    """
+    # Find the union of all keys
+    all_keys = OrderedSet(dict1.keys()) | OrderedSet(dict2.keys())
+
+    # Iterate over all keys
+    for key in all_keys:
+        # Get the values from both dictionaries, or default if missing
+        value1 = dict1.get(key, d1_default)
+        value2 = dict2.get(key, d2_default)
+
+        yield key, value1, value2
+
+
+def flatten(lst: list[Union[T, list[T]]]) -> list[T]:
+    """Flatten a nested list"""
+    flat_list: list[T] = []
+    for item in lst:
+        if isinstance(item, list):
+            flat_list.extend(flatten(item))  # type: ignore[arg-type]
+        else:
+            flat_list.append(item)
+    return flat_list
