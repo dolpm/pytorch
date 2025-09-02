@@ -44,6 +44,7 @@ class CompileArtifacts:
     backend_id: str
     compiled_fn: SerializableCallable
     original_code: types.CodeType
+    closure: Optional[tuple[types.CellType, ...]]
 
     def compiled_function(self) -> Any:
         import_sources = {
@@ -51,7 +52,7 @@ class CompileArtifacts:
             for alias, module_name in self.import_sources.items()
         }
         f_globals = {**import_sources, self.backend_id: self.compiled_fn}
-        core = types.FunctionType(self.bytecode, f_globals)
+        core = types.FunctionType(self.bytecode, f_globals, closure=self.closure)
 
         def optimized_call(*args: Any, **kwargs: Any) -> Any:
             f_locals = bind_locals(self.signature, *args, **kwargs)
@@ -124,6 +125,15 @@ def aot_compile_fullgraph(
 
     signature = inspect.signature(fn)
     f_locals = bind_locals(signature, *args, **kwargs)
+    if fn.__code__.co_freevars and fn.__closure__:
+        assert len(fn.__code__.co_freevars) == len(fn.__closure__)
+        f_locals.update(
+            {
+                name: cell.cell_contents
+                for name, cell in zip(fn.__code__.co_freevars, fn.__closure__)
+            }
+        )
+
     with (
         compile_context(CompileContext(convert_frame.get_compile_id({}))),
         get_metrics_context(),
@@ -135,11 +145,30 @@ def aot_compile_fullgraph(
                 fn.__globals__,
                 f_locals,
                 builtins.__dict__,
-                closure=(),  # type: ignore[arg-type]
+                closure=fn.__closure__ or (),  # type: ignore[arg-type]
             )
         )
         dynamo_output = capture_output.dynamo_output
-        check_fn = dynamo_output.build_guards(fn.__code__, hooks=hooks, save=True)
+
+        if fn.__code__.co_freevars and fn.__closure__:
+            original_filter_fn = hooks.guard_filter_fn or (
+                lambda guard_entries: [True for _ in guard_entries]
+            )
+            hooks.guard_filter_fn = lambda guard_entries: [
+                (
+                    False
+                    if g.guard_type == "CLOSURE_MATCH"
+                    else original_filter_fn(guard_entries)[i]
+                )
+                for i, g in enumerate(guard_entries)
+            ]
+            with torch._dynamo.config.patch(strict_precompile=True):
+                check_fn = dynamo_output.build_guards(
+                    fn.__code__, hooks=hooks, save=True
+                )
+        else:
+            check_fn = dynamo_output.build_guards(fn.__code__, hooks=hooks, save=True)
+
         assert check_fn.guards_state is not None
 
     backend_input = capture_output.backend_input
@@ -167,5 +196,6 @@ def aot_compile_fullgraph(
         backend_id=backend_input.backend_id,
         compiled_fn=compiled_fn,
         original_code=fn.__code__,
+        closure=fn.__closure__,
     )
     return compile_artifacts.compiled_function()

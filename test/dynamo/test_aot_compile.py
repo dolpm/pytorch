@@ -114,6 +114,30 @@ class TestAOTCompile(torch._inductor.test_case.TestCase):
             actual = compiled_fn(mod, *inputs)
             self.assertEqual(expected, actual)
 
+    def test_aot_compile_with_closure(self):
+        def check_inputs(fn):
+            def _fn(*args, **kwargs):
+                for arg in args:
+                    assert arg.shape[0] > 1
+                return fn(*args, **kwargs)
+
+            return _fn
+
+        @check_inputs
+        def foo(x, y):
+            a = x + x
+            b = y + y
+            c = a + b
+            return c
+
+        def backend(gm, example_inputs):
+            return CustomCompiledFunction(gm, example_inputs)
+
+        example_inputs = (torch.ones(3), torch.ones(3))
+        aot_compiled_fn = torch.compile(
+            foo, fullgraph=True, backend=backend
+        ).aot_compile((example_inputs, {}))
+
 
 if __name__ == "__main__":
     from torch._dynamo.test_case import run_tests
