@@ -6,10 +6,10 @@ import pathlib
 import tempfile
 import unittest
 
-from parameterized import parameterized
-
 import torch
 import torch._dynamo as torchdynamo
+
+from parameterized import parameterized
 from torch._C._nativert import PyModelRunner
 from torch._dynamo.test_case import TestCase
 from torch._subclasses.fake_tensor import FakeTensor
@@ -243,8 +243,11 @@ class TestNativeRT(TestCase):
 
     parameters = []
     for device in ["cpu", "cuda"]:
-        if device == "cuda" and not HAS_GPU:
+        if device == "cuda" and (
+            not HAS_GPU or not torch.cuda.get_device_name().startswith("NVIDIA")
+        ):
             continue
+
         for module, sample_inputs in [
             (get_module.__func__().to(device), (torch.randn(4, 4).to(device),)),
             (
