@@ -2,14 +2,19 @@
 import threading
 from collections.abc import Callable, Sequence
 from functools import lru_cache
-from itertools import chain
+from itertools import chain, product
 from typing import cast, Optional, Union
 
 import torch
 from torch._ops import OpOverload
 from torch._subclasses import FakeTensorMode
 from torch.distributed._functional_collectives import _are_we_tracing
-from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
+from torch.distributed._tensor.placement_types import (
+    DTensorSpec,
+    Replicate,
+    Shard,
+    TensorMeta,
+)
 from torch.distributed.tensor._op_schema import (
     OpInfo,
     OpSchema,
@@ -17,6 +22,7 @@ from torch.distributed.tensor._op_schema import (
     OpStrategy,
     OutputSharding,
     OutputSpecType,
+    PlacementList,
     RuntimeSchemaInfo,
     StrategyType,
     TupleStrategy,
@@ -24,6 +30,7 @@ from torch.distributed.tensor._op_schema import (
 from torch.distributed.tensor._utils import (
     compute_local_shape_and_global_offset,
     compute_local_stride,
+    try_find_mesh_from_args,
 )
 
 
@@ -82,6 +89,9 @@ class ShardingPropagator:
             aten.slice_backward.default: 1,
         }
 
+        # op map to save decomposition tables so that the op strategy can be generated from decomposition
+        self.op_to_decompositions: dict[OpOverload, dict[OpOverload, Callable]] = {}
+
     def register_sharding_prop_rule(
         self,
         op_overload: OpOverload,
@@ -92,6 +102,20 @@ class ShardingPropagator:
         Register a sharding propagation rule for an operator.
         """
         self.op_to_rules[op_overload] = rule_func
+        if schema_info is not None:
+            self.op_to_schema_info[op_overload] = schema_info
+
+    def register_op_decomposition(
+        self,
+        op_overload: OpOverload,
+        decomposition_table: dict[OpOverload, Callable],
+        schema_info: Optional[RuntimeSchemaInfo] = None,
+    ) -> None:
+        """
+        Register a decomposition table for an operator.
+        """
+        self.op_to_decompositions[op_overload] = decomposition_table
+
         if schema_info is not None:
             self.op_to_schema_info[op_overload] = schema_info
 
@@ -291,41 +315,217 @@ class ShardingPropagator:
             assert output_specs is None
             return output_specs
 
-    def _wrap_with_op_strategy(self, op_schema: OpSchema) -> OpSchema:
+    def _wrap_with_op_strategy(self, op_schema: OpSchema) -> OpStrategy:
         """
         wrap a op_schema that contains DTensorSpec to another op_schema that contains
         OpStrategy/TupleStrategy, the returned op_schema is then used for sharding
         strategy propagation on pytorch operators.
         """
 
-        def spec_to_strategy(spec: object) -> object:
-            if isinstance(spec, DTensorSpec):
-                return OpStrategy([OpSpec(spec)])
-            elif (
-                isinstance(spec, (list, tuple))
-                and len(spec) > 0
-                and isinstance(spec[0], DTensorSpec)
-            ):
-                # tensor list create tuple strategy
-                tuple_strategy = [spec_to_strategy(s) for s in spec]
-                tuple_strategy = cast(Sequence[StrategyType], tuple_strategy)
-                return TupleStrategy(
-                    tuple(tuple_strategy) if isinstance(spec, tuple) else tuple_strategy
-                )
-            else:
-                return spec
+        if op_schema.op in self.op_to_decompositions:
+            decomposition_table = self.op_to_decompositions[op_schema.op]
+            return self._generate_op_strategy_from_decomposition(
+                op_schema, decomposition_table
+            )
+        else:
+            return self.op_strategy_funcs[op_schema.op](
+                self._spec_schema_to_strategy_schema(op_schema)
+            )
 
-        args_op_strategy = [spec_to_strategy(i) for i in op_schema.args_schema]
+    def _spec_to_strategy(self, spec: object) -> object:
+        if isinstance(spec, DTensorSpec):
+            return OpStrategy([OpSpec(spec)])
+        elif (
+            isinstance(spec, (list, tuple))
+            and len(spec) > 0
+            and isinstance(spec[0], DTensorSpec)
+        ):
+            # tensor list create tuple strategy
+            tuple_strategy = [self._spec_to_strategy(s) for s in spec]
+            tuple_strategy = cast(Sequence[StrategyType], tuple_strategy)
+            return TupleStrategy(
+                tuple(tuple_strategy) if isinstance(spec, tuple) else tuple_strategy
+            )
+        else:
+            return spec
 
+    def _spec_schema_to_strategy_schema(self, op_schema: OpSchema) -> OpSchema:
+        # swap the args spec with args strategies
+        args_op_strategy = [self._spec_to_strategy(i) for i in op_schema.args_schema]
         kwargs_op_strategy = {
-            k: spec_to_strategy(v) for k, v in op_schema.kwargs_schema.items()
+            k: self._spec_to_strategy(v) for k, v in op_schema.kwargs_schema.items()
         }
 
+        # construct a new OpSchema on args for strategy based propagation
         return OpSchema(
             op=op_schema.op,
             args_schema=tuple(args_op_strategy),
             kwargs_schema=kwargs_op_strategy,
-            schema_info=op_schema.schema_info,
+        )
+
+    def _prepare_op_graph(
+        self,
+        op_schema: OpSchema,
+        decomposition_table: dict[OpOverload, Callable],
+    ) -> Optional[torch.fx.GraphModule]:
+        from torch.fx.experimental.proxy_tensor import get_isolated_graphmodule
+
+        # call tracing in fake tensor mode to avoid materializing memory
+        with FakeTensorMode():
+            fake_args = op_schema.gen_fake_args()
+            fake_kwargs = op_schema.gen_fake_kwargs()
+            gm = get_isolated_graphmodule(
+                op_schema.op,
+                fake_args,
+                fake_kwargs,
+                decomposition_table=decomposition_table,
+            )
+
+        return gm
+
+    def _propagate_sharding_through_graph(self, gm, input_specs):
+        # 1. for each call_function, generate an OpSchema and run sharding prop
+        # 2. filter out those which needs_redistribute
+        node_to_spec = {}
+        placeholder_idx = 0
+        for node in gm.graph.nodes:
+            if node.op == "placeholder":
+                node_to_spec[node] = input_specs[placeholder_idx]
+                placeholder_idx += 1
+            elif node.op == "call_function":
+                if (
+                    not isinstance(node.target, OpOverload)
+                    or node.target not in self.op_strategy_funcs
+                ):
+                    raise NotImplementedError(
+                        "Generating sharding strategy via decomposition failed "
+                        f"because {node.target} does not have a sharding strategy registered."
+                    )
+
+                # generate node output spec via sharding propagation
+                node_input_arg_strategies = tuple(
+                    self._spec_to_strategy(node_to_spec.get(arg, arg))
+                    for arg in node.args
+                )
+                node_input_kwarg_strategies = {
+                    k: self._spec_to_strategy(node_to_spec.get(v, v))
+                    for k, v in node.kwargs.items()
+                }
+                node_input_strategy_schema: OpSchema = OpSchema(
+                    op=node.target,
+                    args_schema=node_input_arg_strategies,
+                    kwargs_schema=node_input_kwarg_strategies,
+                )
+
+                node_output_strategy = self.op_strategy_funcs[node.target](
+                    node_input_strategy_schema
+                )
+                assert isinstance(node_output_strategy, OpStrategy), (
+                    "TupleStrategy is not supported in decomposed sharding propagation"
+                )
+
+                # select the first OpSpec with needs_redistribute=False
+                # NOTE: there should be only one such OpSpec; revisit if we find exceptions
+                node_output_spec = None
+                needs_redistribute = False
+                for strtg in node_output_strategy.strategies:
+                    if strtg.input_specs is None:
+                        assert isinstance(strtg.output_specs, DTensorSpec)
+                    for idx, input_strategy in enumerate(
+                        node_input_strategy_schema.args_strategy
+                    ):
+                        desired_spec = (
+                            strtg.output_spec
+                            if strtg.input_specs is None
+                            else strtg.input_specs[idx]
+                        )
+                        if (
+                            input_strategy.strategies[0].output_spec.placements
+                            != desired_spec.placements
+                        ):
+                            needs_redistribute = True
+                            break
+                    if not needs_redistribute:
+                        node_output_spec = strtg.output_spec
+                        break
+
+                if node_output_spec is None:
+                    return None
+
+                node_output_spec.tensor_meta = TensorMeta(
+                    shape=node.meta["tensor_meta"].shape,
+                    stride=node.meta["tensor_meta"].stride,
+                    dtype=node.meta["tensor_meta"].dtype,
+                )
+
+                node_to_spec[node] = node_output_spec
+            elif node.op == "output":
+                output_node = node.args[0]
+                graph_output_specs = [node_to_spec[node] for node in output_node]
+                return graph_output_specs
+            else:
+                raise NotImplementedError(f"Unsupported node type: {node.op}")
+
+    def _generate_op_strategy_from_decomposition(
+        self, op_schema, decomposition_table
+    ) -> OpStrategy:
+        # TODO(lty): expand_to_full_mesh_op_strategy hit circular import if put outside
+        from torch.distributed.tensor._ops.utils import expand_to_full_mesh_op_strategy
+        from torch.utils._pytree import tree_flatten
+
+        mesh = try_find_mesh_from_args(op_schema.op, op_schema.args_schema)
+
+        # generate all possible placements for each DTensor input
+        all_possible_schema = []
+        flat_args_schema, _ = tree_flatten(
+            [op_schema.args_schema, op_schema.kwargs_schema]
+        )
+        for arg_spec in flat_args_schema:
+            if isinstance(arg_spec, DTensorSpec):
+                possible_placements = [Replicate()] + [
+                    Shard(i) for i in range(arg_spec.ndim)
+                ]
+                possible_arg_specs = tuple(
+                    DTensorSpec(mesh, (p,), arg_spec.tensor_meta)
+                    for p in possible_placements
+                )
+                all_possible_schema.append(possible_arg_specs)
+            else:
+                all_possible_schema.append((arg_spec,))
+
+        op_gm = self._prepare_op_graph(op_schema, decomposition_table)
+
+        single_mesh_dim_strategies: list[PlacementList] = []
+        # for each possible input placement combination, run sharding propagation through the graph
+        for graph_input_specs in product(*all_possible_schema):
+            graph_output_specs = self._propagate_sharding_through_graph(
+                op_gm, graph_input_specs
+            )
+            if graph_output_specs is not None:
+                input_placements: PlacementList = [
+                    item.placements[0] if isinstance(item, DTensorSpec) else None
+                    for item in graph_input_specs
+                ]
+                output_placements: PlacementList = [
+                    item.placements[0] if isinstance(item, DTensorSpec) else None
+                    for item in graph_output_specs
+                ]
+                output_input_placements: PlacementList = (
+                    output_placements + input_placements
+                )
+                single_mesh_dim_strategies.append(output_input_placements)
+
+        strategy_schema = self._spec_schema_to_strategy_schema(op_schema)
+
+        assert len(single_mesh_dim_strategies) > 0, (
+            f"No valid strategy found for {op_schema.op} via decomposition!"
+        )
+
+        return expand_to_full_mesh_op_strategy(
+            mesh,
+            strategy_schema,
+            single_mesh_dim_strategies,
+            input_index=len(op_schema.op._schema.returns),
         )
 
     def propagate(self, op_info: OpInfo) -> None:
@@ -351,12 +551,12 @@ class ShardingPropagator:
             return OutputSharding(None, op_schema)
 
         out_tensor_meta = self._propagate_tensor_meta_non_cached(op_schema)
-        if op_schema.op in self.op_strategy_funcs:
+        if (
+            op_schema.op in self.op_strategy_funcs
+            or op_schema.op in self.op_to_decompositions
+        ):
             # wrap the op_schema with op strategy for sharding strategy propagation
-            strategy_schema = self._wrap_with_op_strategy(op_schema)
-
-            # run sharding strategy propagation/generation
-            op_strategy = self.op_strategy_funcs[op_schema.op](strategy_schema)
+            op_strategy = self._wrap_with_op_strategy(op_schema)
 
             if isinstance(op_strategy, OpStrategy):
                 # single Op strategy
