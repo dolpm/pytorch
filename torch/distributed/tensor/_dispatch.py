@@ -155,6 +155,13 @@ class OpDispatcher:
         try:
             self.sharding_propagator.propagate(op_info)
         except NotImplementedError:
+            if op_info.schema.op in self.sharding_propagator.decomposition_fns:
+                out = self.sharding_propagator.decomposition_fns[op_info.schema.op](
+                    *args, **kwargs
+                )
+                assert out is not NotImplemented
+                return out
+
             if torch._C._dispatch_has_kernel_for_dispatch_key(
                 op_call.name(), torch._C.DispatchKey.CompositeImplicitAutograd
             ):

@@ -81,6 +81,21 @@ class ShardingPropagator:
             aten.select_backward.default: 1,
             aten.slice_backward.default: 1,
         }
+        self.decomposition_fns: dict[OpOverload, Callable] = {}
+
+    def register_op_decomposition(
+        self,
+        op_overload: OpOverload,
+        decomposition_fn: Callable,
+        schema_info: Optional[RuntimeSchemaInfo] = None,
+    ):
+        """
+        register a decomposition function for an unsupported op so we can
+        shard-propagate by executing its decomposition body eagerly.
+        """
+        self.decomposition_fns[op_overload] = decomposition_fn
+        if schema_info is not None:
+            self.op_to_schema_info[op_overload] = schema_info
 
     def register_sharding_prop_rule(
         self,
