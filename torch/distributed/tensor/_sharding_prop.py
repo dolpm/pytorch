@@ -2,13 +2,14 @@
 import threading
 from collections.abc import Callable, Sequence
 from functools import lru_cache
-from itertools import chain
+from itertools import chain, product
 from typing import cast, Optional, Union
 
 import torch
 from torch._ops import OpOverload
 from torch._subclasses import FakeTensorMode
 from torch.distributed._functional_collectives import _are_we_tracing
+from torch.distributed.tensor._collective_utils import redistribute_cost
 from torch.distributed.tensor._dtensor_spec import DTensorSpec, TensorMeta
 from torch.distributed.tensor._op_schema import (
     OpInfo,
@@ -25,9 +26,161 @@ from torch.distributed.tensor._utils import (
     compute_local_shape_and_global_offset,
     compute_local_stride,
 )
+from torch.utils._mode_utils import no_dispatch
 
 
 aten = torch.ops.aten
+
+
+class _RedistributeNeeded(Exception):
+    pass
+
+
+def _iter_tensors(obj):
+    if isinstance(obj, torch.Tensor):
+        yield obj
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            yield from _iter_tensors(item)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            yield from _iter_tensors(value)
+
+
+class _SpecMode(torch.utils._python_dispatch.TorchDispatchMode):
+    """
+    intercepts aten ops during decomposition executed on FakeTensors,
+    maintaining a mapping FakeTensor(id) -> DTensorSpec (with TensorMeta).
+    each op call is converted to an OpSchema of DTensorSpecs, routed through
+    propagate_op_sharding, and returns fresh FakeTensors registered
+    with the output DTensorSpecs so op specs flow naturally through the
+    execution.
+
+    if any prop in the chain requires a redistribute, we will fail
+    and start over with a different combination of inputs
+    """
+
+    def __init__(
+        self,
+        propagator: "ShardingPropagator",
+    ):
+        super().__init__()
+        self.propagator = propagator
+        self._tensor_id_to_spec: dict[int, DTensorSpec] = {}
+
+    def register_tensor(self, t: torch.Tensor, spec: DTensorSpec) -> None:
+        self._tensor_id_to_spec[id(t)] = spec
+
+    def has_spec(self, t: torch.Tensor) -> bool:
+        return id(t) in self._tensor_id_to_spec
+
+    # i think we can infer that all tensors will be on the same mesh,
+    # so we could ig force replicate on the mesh of any other tensor
+    # in this decomp, but since i haven't reached this case yet
+    # i think it's better to just fail loudly for now
+    def _ensure_all_tensor_args_bound(self, op, args, kwargs) -> None:
+        for t in _iter_tensors((args, kwargs)):
+            if isinstance(t, torch.Tensor) and not self.has_spec(t):
+                raise RuntimeError(
+                    "encountered unbound tensor argument in decomp propagation: ", t
+                )
+
+    def lookup_spec(self, t: torch.Tensor) -> DTensorSpec:
+        try:
+            return self._tensor_id_to_spec[id(t)]
+        except KeyError:
+            raise RuntimeError(
+                "Missing DTensorSpec for FakeTensor encountered in _SpecMode"
+            )
+
+    def extract_specs(self, obj):
+        if isinstance(obj, torch.Tensor):
+            return self.lookup_spec(obj)
+        elif isinstance(obj, list):
+            return [self.extract_specs(x) for x in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self.extract_specs(x) for x in obj)
+        else:
+            return obj
+
+    def __torch_dispatch__(self, op, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+
+        # no tensors, no problem!
+        try:
+            _ = next(_iter_tensors((args, kwargs)))
+        except StopIteration:
+            with no_dispatch():
+                return op(*args, **kwargs)
+
+        # check for unbound args, which will cause issues
+        self._ensure_all_tensor_args_bound(op, args, kwargs)
+
+        def to_schema(x):
+            if isinstance(x, torch.Tensor):
+                return self.lookup_spec(x)
+            elif isinstance(x, list):
+                return [to_schema(i) for i in x]
+            elif isinstance(x, tuple):
+                return tuple(to_schema(i) for i in x)
+            else:
+                return x
+
+        args_schema = tuple(to_schema(a) for a in args)
+        kwargs_schema = {k: to_schema(v) for k, v in kwargs.items()}
+        schema_info = self.propagator.op_to_schema_info.get(op, None)
+        op_schema = OpSchema(op, args_schema, kwargs_schema, schema_info)
+
+        try:
+            # there might be some silly business that happens
+            # causing an exception to occur do to the input placements
+            # so we want to catch all of these and try the next placement
+            # from the top
+            out_sharding = self.propagator.propagate_op_sharding(op_schema)
+        except:
+            raise _RedistributeNeeded
+
+        # bail if some inner op requires redistribute
+        # so that we can try on another input combination
+        if out_sharding.needs_redistribute:
+            raise _RedistributeNeeded
+
+        out_specs = out_sharding.output_spec
+
+        def make_fake_from_spec(spec: DTensorSpec) -> torch.Tensor:
+            tm = spec.tensor_meta
+            if not isinstance(tm, TensorMeta):
+                raise RuntimeError("decomp output DTensorSpec must have TensorMeta")
+
+            with no_dispatch():
+                t = (
+                    torch.empty_strided(
+                        tm.shape, tm.stride, dtype=tm.dtype, device="meta"
+                    )
+                    if tm.stride is not None
+                    else torch.empty(tm.shape, dtype=tm.dtype, device="meta")
+                )
+
+            self.register_tensor(t, spec)
+            return t
+
+        def wrap_outputs(specs):
+            if isinstance(specs, DTensorSpec):
+                return make_fake_from_spec(specs)
+            elif isinstance(specs, list):
+                return [
+                    make_fake_from_spec(s) if isinstance(s, DTensorSpec) else s
+                    for s in specs
+                ]
+            elif isinstance(specs, tuple):
+                return tuple(
+                    make_fake_from_spec(s) if isinstance(s, DTensorSpec) else s
+                    for s in specs
+                )
+            else:
+                return specs
+
+        return wrap_outputs(out_specs)
 
 
 def _length(obj) -> int:
@@ -81,6 +234,21 @@ class ShardingPropagator:
             aten.select_backward.default: 1,
             aten.slice_backward.default: 1,
         }
+        self.decomposition_fns: dict[OpOverload, Callable] = {}
+
+    def register_op_decomposition(
+        self,
+        op_overload: OpOverload,
+        decomposition_fn: Callable,
+        schema_info: Optional[RuntimeSchemaInfo] = None,
+    ):
+        """
+        register a decomposition function for an unsupported op so we can
+        shard-prop by prop-ing through its decomposition body.
+        """
+        self.decomposition_fns[op_overload] = decomposition_fn
+        if schema_info is not None:
+            self.op_to_schema_info[op_overload] = schema_info
 
     def register_sharding_prop_rule(
         self,
@@ -563,10 +731,25 @@ class ShardingPropagator:
             output_sharding.output_spec = new_output_spec
 
             return output_sharding
-        else:
-            raise NotImplementedError(
-                f"Operator {op_schema.op} does not have a sharding strategy registered."
-            )
+        if op_schema.op in self.decomposition_fns:
+            try:
+                output_sharding = self._try_decomposition_cross_product_with_prop(
+                    op_schema
+                )
+
+                # will get passed to not implemented below
+                assert output_sharding is not None
+
+                new_output_spec = self._create_output_spec_with_new_tensor_meta(
+                    op_schema.op, output_sharding.output_spec, out_tensor_meta
+                )
+                output_sharding.output_spec = new_output_spec
+                return output_sharding
+            except Exception:
+                pass
+        raise NotImplementedError(
+            f"Operator {op_schema.op} does not have a sharding strategy registered."
+        )
 
     def _select_strategy(
         self, strategy: OpStrategy, op_schema: Optional[OpSchema] = None
@@ -646,3 +829,192 @@ class ShardingPropagator:
             )
 
         return OpSchema(schema.op, tuple(expected_input_schema), schema.kwargs_schema)
+
+    def _try_decomposition_cross_product_with_prop(
+        self, op_schema: OpSchema
+    ) -> Optional[OutputSharding]:
+        """
+        try to propagate sharding through decomposition by exploring all possible
+        input sharding combinations sorted by redistribute cost, using a dispatch
+        mode to re-propagate through each decomposed op.
+        """
+        dtensor_specs = []
+        dtensor_indices = []
+        dtensor_keys = []
+
+        for i, arg in enumerate(op_schema.args_schema):
+            if isinstance(arg, DTensorSpec):
+                dtensor_specs.append(arg)
+                dtensor_indices.append(i)
+        for k, kwarg in op_schema.kwargs_schema.items():
+            if isinstance(kwarg, DTensorSpec):
+                dtensor_specs.append(kwarg)
+                dtensor_keys.append(k)
+
+        if not dtensor_specs:
+            return None
+
+        # first try the original input combination since it will be the cheapest (no redistribution cost)
+        # and only if that fails should we try the others
+        try:
+            return self._try_decomposition_with_prop_dispatch(op_schema)
+        except _RedistributeNeeded:
+            pass
+
+        mesh = dtensor_specs[0].mesh  # should be the same for all?
+        possible_placements = self._generate_possible_placements(mesh)
+        all_combinations = set(product(possible_placements, repeat=len(dtensor_specs)))
+
+        # remove the original combination since we already tried it
+        original_combination = tuple(spec.placements for spec in dtensor_specs)
+        all_combinations.discard(original_combination)
+
+        # sort combinations by redistribute cost..
+        # ideally, we should limit this to a small domain
+        # and just fall back to all-replicate if none of those
+        # work. there are some heuristics we can employ to figure
+        # out which ones we think are important enough to make the
+        # cut
+        sorted_combinations = self._sort_combinations_by_cost(
+            list(all_combinations), dtensor_specs, mesh
+        )
+
+        # try each until one succeeds
+        for combination in sorted_combinations:
+            try:
+                new_specs = []
+                for j, (orig_spec, new_placements) in enumerate(
+                    zip(dtensor_specs, combination)
+                ):
+                    new_spec = DTensorSpec(
+                        mesh=mesh,
+                        placements=new_placements,
+                        tensor_meta=orig_spec.tensor_meta,
+                    )
+                    new_specs.append(new_spec)
+
+                modified_args_schema = list(op_schema.args_schema)
+                for j, spec_idx in enumerate(dtensor_indices):
+                    modified_args_schema[spec_idx] = new_specs[j]
+
+                j = len(dtensor_indices)
+
+                modified_kwargs_schema = dict(op_schema.kwargs_schema)
+                for k in dtensor_keys:
+                    modified_kwargs_schema[k] = new_specs[j]
+                    j += 1
+
+                modified_schema = OpSchema(
+                    op=op_schema.op,
+                    args_schema=tuple(modified_args_schema),
+                    kwargs_schema=modified_kwargs_schema,
+                    schema_info=op_schema.schema_info,
+                )
+
+                return OutputSharding(
+                    output_spec=self._try_decomposition_with_prop_dispatch(
+                        modified_schema
+                    ).output_spec,
+                    redistribute_schema=modified_schema,
+                    needs_redistribute=True,
+                )
+
+            except _RedistributeNeeded:
+                continue
+
+        return None
+
+    def _generate_possible_placements(self, mesh):
+        """generate all placement combinations for the given mesh. this could use some work -- ref to the comment where this is called"""
+        from torch.distributed.tensor.placement_types import Partial, Replicate, Shard
+
+        placements = [Replicate()]
+
+        # we should probably limit this
+        # to prevent blowup
+        for tensor_dim in range(mesh.ndim):
+            placements.append(Shard(tensor_dim))
+
+        placements.append(Partial())
+
+        possible_placements = []
+        for placement_combo in product(placements, repeat=mesh.ndim):
+            possible_placements.append(placement_combo)
+
+        return possible_placements
+
+    def _sort_combinations_by_cost(self, combinations, original_specs, mesh):
+        """sort input combinations by total redistribute cost, preferring less changes if costs are equivalent"""
+
+        def compute_total_cost(combination):
+            total_cost = 0.0
+            for orig_spec, new_placements in zip(original_specs, combination):
+                new_spec = DTensorSpec(
+                    mesh=mesh,
+                    placements=new_placements,
+                    tensor_meta=orig_spec.tensor_meta,
+                )
+                cost = redistribute_cost(orig_spec, new_spec)
+                if cost == float("inf"):
+                    return float("inf")
+                total_cost += cost
+            return total_cost
+
+        def sort_key(combination):
+            cost = compute_total_cost(combination)
+
+            if cost == 0.0:
+                return (cost, 0)
+
+            similarity_score = 0
+            for orig_spec, new_placements in zip(original_specs, combination):
+                if orig_spec.placements == new_placements:
+                    similarity_score += 1
+
+            return (cost, -similarity_score)
+
+        return sorted(combinations, key=sort_key)
+
+    def _try_decomposition_with_prop_dispatch(
+        self, modified_schema: OpSchema
+    ) -> Optional[OutputSharding]:
+        """
+        try to execute the decomposition using _SpecMode that maintains
+        FakeTensor -> DTensorSpec mapping and re-propagates through each decomposed op.
+
+        will raise _RedistributeNeeded if the prop failed
+        """
+        from torch.fx.experimental.proxy_tensor import disable_proxy_modes_tracing
+
+        decomposition_fn = self.decomposition_fns[modified_schema.op]
+
+        with (
+            _SpecMode(self) as spec_mode,
+            FakeTensorMode(),
+            disable_proxy_modes_tracing(),
+        ):
+            fake_args = modified_schema.gen_fake_args()
+            fake_kwargs = modified_schema.gen_fake_kwargs()
+
+            for fake_arg, arg_spec in zip(fake_args, modified_schema.args_schema):
+                if isinstance(fake_arg, torch.Tensor) and isinstance(
+                    arg_spec, DTensorSpec
+                ):
+                    spec_mode.register_tensor(fake_arg, arg_spec)
+
+            for k, fake_kwarg in fake_kwargs.items():
+                if (
+                    isinstance(fake_kwarg, torch.Tensor)
+                    and k in modified_schema.kwargs_schema
+                ):
+                    kwarg_spec = modified_schema.kwargs_schema[k]
+                    if isinstance(kwarg_spec, DTensorSpec):
+                        spec_mode.register_tensor(fake_kwarg, kwarg_spec)
+
+            return OutputSharding(
+                output_spec=spec_mode.extract_specs(
+                    decomposition_fn(*fake_args, **fake_kwargs)
+                ),
+                redistribute_schema=None,
+                needs_redistribute=False,
+            )

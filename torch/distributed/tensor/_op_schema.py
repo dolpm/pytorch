@@ -76,6 +76,7 @@ def _rebuild_tensor_from_dtensor_meta(arg) -> object:
         arg.tensor_meta.shape,
         arg.tensor_meta.stride,
         dtype=arg.tensor_meta.dtype,
+        device="meta",
     )
 
 
@@ -389,7 +390,7 @@ class OpSchema:
                 args_schema.append(str(arg))
             else:
                 args_schema.append(str(arg))
-        return f"Op(op={self.op}, args_schema={', '.join(args_schema)} @ mesh: {mesh_shape})"
+        return f"Op(op={self.op}, args_schema={', '.join(args_schema)} @ mesh: {mesh_shape}, kwargs_schema={self.kwargs_schema})"
 
     def __post_init__(self) -> None:
         _DTensor_OpSchema_post_init(self)
