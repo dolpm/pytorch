@@ -7,10 +7,11 @@ from logging import getLogger
 from typing import Optional, Union
 
 import torch
+from torch.distributed._local_tensor import maybe_run_for_local_tensor
 from torch.distributed.device_mesh import _get_device_handle, DeviceMesh
 from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor.placement_types import Shard
-
+from torch.distributed._local_tensor import local_tensor_mode, _current_rank
 
 logger = getLogger(__name__)
 
@@ -22,6 +23,7 @@ __all__ = [
 
 _rng_tracker: Optional["_RNGStateTracker"] = None
 _current_dtensor_spec: threading.local = threading.local()
+_per_rank_seeds: dict[int, int] = {}
 
 
 def is_rng_supported_mesh(device_mesh: DeviceMesh) -> bool:
@@ -51,6 +53,7 @@ def is_rng_supported_mesh(device_mesh: DeviceMesh) -> bool:
         return False
 
 
+@maybe_run_for_local_tensor
 def manual_seed(seed: int, device_mesh: DeviceMesh) -> None:
     """Sets the seed for generating random numbers for the calling rank.
 
@@ -88,12 +91,9 @@ def manual_seed(seed: int, device_mesh: DeviceMesh) -> None:
     # )
     # Note: we still need to ensure setting `run_state_sync=False` to support the pp case
 
-    # instantiate a RNG tracker if haven't. By default DTensor uses an
-    # OffsetBasedRNGTracker to perform random operators.
-    global _rng_tracker
-    if not _rng_tracker:
-        _rng_tracker = OffsetBasedRNGTracker(device_mesh, run_state_sync=False)
-
+    # Check if current rank is in the device mesh before creating RNG tracker.
+    # I think this should be fine since the tracker ctor shouldn't have any
+    # side-effects on device_mesh...
     if device_mesh.get_coordinate() is None:
         raise RuntimeError(
             "manual_seed requires the current rank to be a part of the device mesh "
@@ -101,8 +101,34 @@ def manual_seed(seed: int, device_mesh: DeviceMesh) -> None:
             "the behavior of DTensor random ops is undefined."
         )
 
+    # instantiate a RNG tracker if haven't. By default DTensor uses an
+    # OffsetBasedRNGTracker to perform random operators.
+    global _rng_tracker
+    if not _rng_tracker:
+        _rng_tracker = OffsetBasedRNGTracker(device_mesh, run_state_sync=False)
+
+    lm = local_tensor_mode()
+    current_rank = getattr(_current_rank, "rank", None)
+
     # DTensor no longer maintains a copy of rng state. manual seed on dtensor is the same thing
     # as manual seed on torch.
+    global _per_rank_seeds
+
+    if lm is not None and current_rank is not None:
+        if isinstance(seed, torch.SymInt):
+            from torch.distributed._local_tensor import LocalIntNode
+            if isinstance(seed.node, LocalIntNode):
+                actual_seed = seed.node._local_ints[current_rank]
+            else:
+                actual_seed = int(seed)
+        else:
+            actual_seed = seed
+
+        # store per-rank seed so it can be applied when random ops execute
+        _per_rank_seeds[current_rank] = actual_seed
+        torch.manual_seed(actual_seed)
+        return
+
     torch.manual_seed(seed)
 
 

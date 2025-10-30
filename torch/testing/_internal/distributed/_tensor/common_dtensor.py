@@ -55,7 +55,8 @@ from torch.testing._internal.common_utils import (
     TEST_XPU,
 )
 from torch.utils._pytree import tree_flatten, tree_unflatten, TreeSpec
-
+import torch.distributed.tensor._random as random
+from torch.distributed._local_tensor import _current_rank
 
 DEVICE_COUNT: int
 
@@ -727,6 +728,13 @@ class LocalDTensorTestBase(DTensorTestBase):
     def tearDown(self) -> None:
         super().tearDown()
         torch.autograd._enable_record_function(True)
+        # Reset the global RNG tracker to ensure clean state between tests
+        random._rng_tracker = None
+        # Reset per-rank seeds to ensure clean state between tests
+        random._per_rank_seeds.clear()
+        # Reset the current rank to ensure clean state between tests
+        if hasattr(_current_rank, 'rank'):
+            del _current_rank.rank
 
     @property
     def rank(self):

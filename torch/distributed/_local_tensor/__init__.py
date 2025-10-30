@@ -209,12 +209,22 @@ def _get_rng_offset_for_rank(rank: int) -> Optional[int]:
 
     # Convert rank to mesh coordinate
     mesh = spec.mesh
-    mesh_shape = mesh.shape
-    mesh_coordinate = []
-    remaining_rank = rank
-    for mesh_dim_size in reversed(mesh_shape):
-        mesh_coordinate.insert(0, remaining_rank % mesh_dim_size)
-        remaining_rank //= mesh_dim_size
+
+    # temporarily set the current rank
+    # and call the patched get_coordinate method
+    saved_rank = getattr(_current_rank, "rank", None)
+    try:
+        _current_rank.rank = rank
+        mesh_coordinate = mesh.get_coordinate()
+    finally:
+        if saved_rank is not None:
+            _current_rank.rank = saved_rank
+        else:
+            if hasattr(_current_rank, "rank"):
+                del _current_rank.rank
+
+    if mesh_coordinate is None:
+        return None
 
     # Use the shared helper method from the RNG tracker
     return random._rng_tracker._compute_offset_for_shard(spec, mesh_coordinate)
@@ -288,6 +298,7 @@ def _for_each_rank_run_func(
 
     is_random = _is_random_op(func)
     base_rng_offset = None
+    device_for_rng = None
 
     rng_state = _get_rng_state()
 
@@ -298,9 +309,13 @@ def _for_each_rank_run_func(
             hasattr(random._current_dtensor_spec, "spec")
             and random._current_dtensor_spec.spec is not None
         ):
-            device = _get_device_from_local_tensors(flat_args)
-            if device is not None and device.type in ("cuda", "xpu", "hpu"):
-                current_state = random.get_rng_state_for_device(device)
+            device_for_rng = _get_device_from_local_tensors(flat_args)
+            if device_for_rng is None:
+                spec = random._current_dtensor_spec.spec
+                device_for_rng = torch.device(f"{spec.mesh.device_type}:0")
+
+            if device_for_rng is not None and device_for_rng.type in ("cuda", "xpu", "hpu"):
+                current_state = random.get_rng_state_for_device(device_for_rng)
                 base_rng_offset = int(current_state[8:].view(dtype=torch.int64).item())
 
     flat_rank_rets = {}
@@ -310,13 +325,19 @@ def _for_each_rank_run_func(
         _current_rank.rank = r
         _set_rng_state(*rng_state)
 
-        if base_rng_offset is not None:
+        # apply per-rank seed if one was stored by manual_seed in LocalTensor mode
+        if is_random:
+            from torch.distributed.tensor import _random as random
+            if hasattr(random, '_per_rank_seeds') and r in random._per_rank_seeds:
+                rank_seed = random._per_rank_seeds[r]
+                torch.manual_seed(rank_seed)
+
+        if base_rng_offset is not None and device_for_rng is not None:
             rank_offset = _get_rng_offset_for_rank(r)
             if rank_offset is not None:
                 try:
-                    device = _get_device_from_local_tensors(flat_args)
-                    if device is not None and device.type in ("cuda", "xpu", "hpu"):
-                        current_state = random.get_rng_state_for_device(device).to(
+                    if device_for_rng.type in ("cuda", "xpu", "hpu"):
+                        current_state = random.get_rng_state_for_device(device_for_rng).to(
                             "cpu"
                         )
 
@@ -326,7 +347,7 @@ def _for_each_rank_run_func(
                         ).view(torch.uint8)
                         current_state[8:] = offset_tensor
 
-                        random.set_rng_state_for_device(device, current_state)
+                        random.set_rng_state_for_device(device_for_rng, current_state)
                 except Exception:
                     pass
 
@@ -395,6 +416,9 @@ class LocalIntNode:
 
     def _str(self) -> str:
         return f"LocalIntNode({self._local_ints})"
+
+    def int_(self) -> int:
+        return self.guard_int("", 0)
 
     def __str__(self) -> str:
         return self._str()
@@ -494,11 +518,14 @@ class LocalIntNode:
             r = self._local_ints[current_rank]
         else:
             unique_values = set(self._local_ints.values())
-            if len(unique_values) != 1:
-                raise AssertionError(
-                    f"Cannot guard LocalIntNode with divergent values across ranks outside of rank context: {self._local_ints}"
+            if len(unique_values) == 1:
+                r = next(iter(unique_values))
+            else:
+                not_implemented_log.warning(
+                    "guard_int called on LocalIntNode with divergent values "
+                    f"outside rank context: {self._local_ints}. Using rank 0's value."
                 )
-            r = next(iter(unique_values))
+                r = self._local_ints[min(self._local_ints.keys())]
 
         try:
             return int(r)
@@ -810,6 +837,7 @@ class LocalTensorMode(TorchDispatchMode):
             self.ranks = ranks
         self._disable = False
         self._old_get_coordinate = None
+        self._old_get_local_rank: Any = None
 
     def __enter__(self) -> "LocalTensorMode":
         self._disable = False
@@ -957,12 +985,16 @@ class LocalTensorMode(TorchDispatchMode):
         assert self._old_get_coordinate is None
         self._old_get_coordinate = DeviceMesh.get_coordinate  # type: ignore[assignment]
         DeviceMesh.get_coordinate = _LocalDeviceMesh.get_coordinate  # type: ignore[method-assign]
+        self._old_get_local_rank = DeviceMesh.get_local_rank  # type: ignore[assignment]
+        DeviceMesh.get_local_rank = _LocalDeviceMesh.get_local_rank  # type: ignore[method-assign]
 
     def _unpatch_device_mesh(self) -> None:
         assert self._old_get_coordinate is not None
         DeviceMesh.get_coordinate = self._old_get_coordinate
+        DeviceMesh.get_local_rank = self._old_get_local_rank  # type: ignore[method-assign]
         # pyrefly: ignore [bad-assignment]
         self._old_get_coordinate = None
+        self._old_get_local_rank = None  # pyrefly: ignore [bad-assignment]
 
 
 class _LocalDeviceMesh:
@@ -970,6 +1002,47 @@ class _LocalDeviceMesh:
     Holds implementations of DeviceMesh functionality that must be patched while running
     under LocalTensorMode.
     """
+
+    @staticmethod
+    def get_local_rank(self: DeviceMesh, mesh_dim: Optional[Union[int, str]] = None) -> Union[int, torch.SymInt]:
+        lm = local_tensor_mode()
+        assert lm is not None, "not in LocalTensorMode"
+
+        local_ranks: dict[int, int] = {}
+
+        with lm.disable():
+            rank_tensor = self._layout.remap_to_tensor(self._rank_map)
+
+            for r in lm.ranks:
+                rank_coords = (rank_tensor == r).nonzero().tolist()
+                if len(rank_coords) == 0:
+                    continue
+
+                assert len(rank_coords) == 1, f"Rank {r} appears multiple times in mesh"
+                # extract coordinates (skip batch dim)
+                coord_ints = [c for c in rank_coords[0][1:]]
+
+                if mesh_dim is None:
+                    # get rank's position in the flattened mesh
+                    mesh_size = list(self.mesh.shape)
+                    local_rank_val = 0
+                    multiplier = 1
+                    for i in reversed(range(len(coord_ints))):
+                        local_rank_val += coord_ints[i] * multiplier
+                        multiplier *= mesh_size[i]
+                    local_ranks[r] = local_rank_val
+                else:
+                    # get coordinate for the dimension
+                    if isinstance(mesh_dim, str):
+                        mesh_dim_idx = self.mesh_dim_names.index(mesh_dim) if self.mesh_dim_names else 0
+                    else:
+                        mesh_dim_idx = mesh_dim
+                    local_ranks[r] = coord_ints[mesh_dim_idx]
+
+        if len(set(local_ranks.values())) == 1:
+            return next(iter(local_ranks.values()))
+
+        return torch.SymInt(LocalIntNode(local_ranks))
 
     @staticmethod
     def get_coordinate(self: DeviceMesh) -> Optional[list[int] | None]:
@@ -980,6 +1053,17 @@ class _LocalDeviceMesh:
         # limit the invasiveness of local tensor.
         lm = local_tensor_mode()
         assert lm is not None, "Unexpectedly not in LocalTensorMode"
+
+        current_rank = getattr(_current_rank, "rank", None)
+
+        if current_rank is not None:
+            rank_tensor = self._layout.remap_to_tensor(self._rank_map)
+            rank_coords = (rank_tensor == current_rank).nonzero().tolist()
+            if len(rank_coords) == 0:
+                return None
+            assert len(rank_coords) == 1
+            # skip batch dim
+            return [c for c in rank_coords[0][1:]]
 
         coords: list[dict[int, int]] = [{} for _ in range(self.ndim)]
         for r in lm.ranks:
